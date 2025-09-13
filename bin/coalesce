@@ -1,0 +1,101 @@
+#!/usr/bin/env zshctl
+
+function _coalesce_dag_descend_run {
+    typeset dag=${1:-} queue=() node
+    shift
+    typeset parts=( "$@" )
+    queue=( "${(@P)dag}" )
+    for node in "${(@)queue}"; do
+        case $_coalesce_node[${dag}_${node}:kind] in
+        (sync)
+            jo -- name=$node under=${(j:/:)parts} kind=sync -b parallel=1 # $_coalesce_node[${dag}_${node}:parallel
+            _coalesce_dag_descend_json ${dag}_${node} "${(@)parts}" $node
+            ;;
+        (pod)
+            jo -- name=$node under=${(j:/:)parts} kind=node
+            ;;
+        esac
+    done
+}
+
+function _coalesce_dag_run {
+    _coalesce_dag_descend_run _coalesce_dag
+}
+
+function _coalesce_dag_descend_json {
+    typeset dag=${1:-} queue=() node
+    shift
+    typeset parts=( "$@" )
+    queue=( "${(@P)dag}" )
+    for node in "${(@)queue}"; do
+        case $_coalesce_node[${dag}_${node}:kind] in
+        (sync)
+            jo -- name=$node under=${(j:/:)parts} kind=sync -b parallel=$_coalesce_node[${dag}_${node}:parallel]
+            _coalesce_dag_descend_json ${dag}_${node} "${(@)parts}" $node
+            ;;
+        (pod)
+            jo -- name=$node under=${(j:/:)parts} kind=node
+            ;;
+        esac
+    done
+}
+
+function _coalesce_dag_json {
+    _coalesce_dag_descend_json _coalesce_dag
+}
+
+# TODO Global variables do not help, just serialize into an associative array
+# and then you can use `:` as a delimiter allowing the user to use snake case.
+function step {
+    # first parse the placement args.
+    eval "$(args n,name u,under -b s,sync p,parallel -- "$@")"
+    typeset -ga _coalesce_dag
+    typeset -gA _coalesce_node
+    typeset node pod split=() under=() join=( coalesce dag ) queue=()
+    if [[ -v o_under ]]; then
+        join=( coalesce dag "${(As:/:)o_under}" )
+    fi
+    under="_${(j:_:)join}"
+    if (( o_sync )); then
+        [[ -v $under ]] || abend "no such node to put under"
+        typeset -ga "${under}_${o_name}"
+        queue=( "${(@P)under}" )
+        queue+=( $o_name )
+        : ${(PA)${under}::=${(@)queue}}
+        _coalesce_node[${under}_${o_name}:kind]=sync
+        _coalesce_node[${under}_${o_name}:parallel]=$o_parallel
+    else
+        [[ -v $under ]] || abend "no such node to put under"
+        typeset args=( "$@" )
+        eval "$(args e,env -- "$@")"
+        queue=( "${(@P)under}" )
+        queue+=( $o_name )
+        : ${(PA)${under}::=${(@)queue}}
+        _coalesce_node[${under}_${o_name}:kind]=pod
+        _coalesce_node[${under}_${o_name}:args]=${(j: :)${(@qq)args}}
+    fi
+}
+
+function execute {
+    source $1
+    _coalesce_dag_json | jq --slurp '
+      . as $all |
+      def find_children($path):
+        $all[] |
+        select(.under == $path) |
+        . as $node |
+        . + {
+          children: [
+            $all | find_children(
+              if $path == null then $node.name
+              else $path + "/" + $node.name
+              end
+            )
+          ]
+        };
+
+      [find_children(null)]
+    '
+}
+
+# vim: ft=zsh :
