@@ -32,7 +32,6 @@ function step {
         join=( coalesce "${(As:/:)o_under}" )
     fi
     under="${(j:-:)join}"
-    print $under
     if (( o_sync )); then
         (( ${+_coalesce_node[$under]} )) || abend "no such node to put under"
         _coalesce_node[$under-$o_name]=

@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pipeline DAG - Coalesce</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <style>
+        body {
+            font-family: monospace;
+            margin: 0;
+            padding: 20px;
+            background: #1e1e1e;
+        }
+        #cy {
+            width: 100%;
+            height: 600px;
+            border: 1px solid #444;
+            background: #2d2d2d;
+        }
+        h1 {
+            color: #e0e0e0;
+            font-size: 18px;
+        }
+        .info {
+            color: #b0b0b0;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Pipeline DAG - Click nodes to see details</h1>
+    <div id="cy"></div>
+    <div class="info" id="info">Click a node to see: container image, environment variables</div>
+
+    <script>
+        // Pretend this came from server - output from bin/coalesce test/pipeline.coalesce.zsh
+        const pipelineData = [
+          {
+            "name": "gather",
+            "under": "coalesce",
+            "kind": "node",
+            "children": []
+          },
+          {
+            "name": "cdl",
+            "under": "coalesce",
+            "kind": "node",
+            "children": []
+          },
+          {
+            "name": "fanout",
+            "under": "coalesce",
+            "kind": "sync",
+            "parallel": true,
+            "children": [
+              {
+                "name": "baz",
+                "under": "coalesce-fanout",
+                "kind": "sync",
+                "parallel": false,
+                "children": [
+                  {
+                    "name": "frobinate",
+                    "under": "coalesce-fanout-baz",
+                    "kind": "sync",
+                    "parallel": true,
+                    "children": [
+                      {
+                        "name": "a",
+                        "under": "coalesce-fanout-baz-frobinate",
+                        "kind": "node",
+                        "children": []
+                      },
+                      {
+                        "name": "b",
+                        "under": "coalesce-fanout-baz-frobinate",
+                        "kind": "node",
+                        "children": []
+                      },
+                      {
+                        "name": "c",
+                        "under": "coalesce-fanout-baz-frobinate",
+                        "kind": "node",
+                        "children": []
+                      },
+                      {
+                        "name": "d",
+                        "under": "coalesce-fanout-baz-frobinate",
+                        "kind": "node",
+                        "children": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "fix",
+                    "under": "coalesce-fanout-baz",
+                    "kind": "node",
+                    "children": []
+                  },
+                  {
+                    "name": "stitch",
+                    "under": "coalesce-fanout-baz",
+                    "kind": "node",
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "name": "bar",
+                "under": "coalesce-fanout",
+                "kind": "sync",
+                "parallel": false,
+                "children": [
+                  {
+                    "name": "frobinate",
+                    "under": "coalesce-fanout-bar",
+                    "kind": "sync",
+                    "parallel": true,
+                    "children": [
+                      {
+                        "name": "a",
+                        "under": "coalesce-fanout-bar-frobinate",
+                        "kind": "node",
+                        "children": []
+                      },
+                      {
+                        "name": "b",
+                        "under": "coalesce-fanout-bar-frobinate",
+                        "kind": "node",
+                        "children": []
+                      },
+                      {
+                        "name": "c",
+                        "under": "coalesce-fanout-bar-frobinate",
+                        "kind": "node",
+                        "children": []
+                      },
+                      {
+                        "name": "d",
+                        "under": "coalesce-fanout-bar-frobinate",
+                        "kind": "node",
+                        "children": []
+                      }
+                    ]
+                  },
+                  {
+                    "name": "stitch",
+                    "under": "coalesce-fanout-bar",
+                    "kind": "node",
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "over",
+            "under": "coalesce",
+            "kind": "node",
+            "children": []
+          }
+        ];
+
+        // Convert the tree structure to nodes and edges for Cytoscape
+        const nodes = [];
+        const edges = [];
+
+        nodes.push({
+            data: {
+                id: 'coalesce',
+                label: 'coalesce',
+                kind: 'sync',
+                parallel: false,
+                path: 'coalesce'
+            },
+            classes: 'sync-serial'
+        });
+
+        function nodeClasses(step) {
+            return step.kind == 'node' ?
+                'node' : step.parallel
+                       ? 'sync-parallel' : 'sync-serial'
+        }
+
+        function nodeParallel(step, previous = []) {
+            const next = []
+            for (const child of step.children) {
+                let id = `${child.under}-${child.name}`
+                nodes.push({
+                    data: {
+                        id: id,
+                        label: child.name,
+                        kind: child.kind,
+                        parallel: child.parallel,
+                        path: id.replaceAll('-', '/'),
+                    },
+                    classes: nodeClasses(child)
+                });
+                for (const source of previous) {
+                    edges.push({ data: {  source: source, target: id } })
+                }
+                next.push.apply(next, nodeSteps(child.children, [ id ]))
+            }
+            return next
+        }
+
+        function nodeSteps (steps, previous = []) {
+            let id, parallelId
+            for (const step of steps) {
+                id = `${step.under}-${step.name}`
+                nodes.push({
+                    data: {
+                        id: id,
+                        label: step.name,
+                        kind: step.kind,
+                        parallel: step.parallel,
+                        path: id.replaceAll('-', '/'),
+                    },
+                    classes: nodeClasses(step)
+                });
+                if (previous.length != 0) {
+                    for (const source of previous) {
+                        edges.push({ data: { source: source, target: id } })
+                    }
+                }
+                if (step.children.length != 0) {
+                    if (step.parallel != null && step.parallel) {
+                        previous = nodeParallel(step, [ id ])
+                    } else {
+                        previous.push.apply(previous, nodeSteps(step.children, [ id ]))
+                    }
+                } else {
+                    previous = [ id ]
+                }
+            }
+            return previous
+        }
+
+        nodeSteps(pipelineData, [ 'coalesce' ]);
+
+        // Create Cytoscape instance
+        const cy = cytoscape({
+            container: document.getElementById('cy'),
+
+            elements: [ ...nodes, ...edges ],
+
+            style: [
+                {
+                    selector: 'node',
+                    style: {
+                        'background-color': '#4a9eff',
+                        'label': 'data(label)',
+                        'color': '#ffffff',
+                        'text-valign': 'center',
+                        'text-halign': 'center',
+                        'font-size': '12px',
+                        'font-family': 'monospace',
+                        'width': '80px',
+                        'height': '40px',
+                        'shape': 'roundrectangle'
+                    }
+                },
+                {
+                    selector: '.sync-serial',
+                    style: {
+                        'background-color': '#666',
+                        'shape': 'ellipse',
+                        'width': '60px',
+                        'height': '60px'
+                    }
+                },
+                {
+                    selector: '.sync-parallel',
+                    style: {
+                        'background-color': '#ff9900',
+                        'shape': 'diamond',
+                        'width': '70px',
+                        'height': '70px'
+                    }
+                },
+                {
+                    selector: 'edge',
+                    style: {
+                        'width': 2,
+                        'line-color': '#888',
+                        'target-arrow-color': '#888',
+                        'target-arrow-shape': 'triangle',
+                        'curve-style': 'taxi',
+                        'taxi-direction': 'downward',
+                        'taxi-turn': '50px',
+                        'taxi-turn-min-distance': '10px'
+                    }
+                },
+                {
+                    selector: 'node:selected',
+                    style: {
+                        'background-color': '#ffaa00',
+                        'border-width': 2,
+                        'border-color': '#ffffff'
+                    }
+                }
+            ],
+
+            layout: {
+                name: 'breadthfirst',
+                directed: true,
+                spacingFactor: 1.5,
+                nodeDimensionsIncludeLabels: true
+            }
+        });
+
+        // Handle node clicks
+        cy.on('tap', 'node', function(evt){
+            const node = evt.target;
+            const data = node.data();
+            let info = `<strong>${data.label}</strong><br>`;
+            info += `Path: ${data.path}<br>`;
+
+            if (data.kind === 'sync') {
+                info += data.parallel ? 'Parallel sync point - children run simultaneously<br>' : 'Serial sync point - children run sequentially<br>';
+            } else {
+                info += 'Container node<br>';
+                info += `<br>URL: https://build.example.org/coalesce/${data.id}.html`;
+            }
+
+            document.getElementById('info').innerHTML = info;
+        });
+    </script>
+</body>
+</html>
