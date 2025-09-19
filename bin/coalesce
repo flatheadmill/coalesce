@@ -1,30 +1,133 @@
 #!/usr/bin/env zshctl
 
-#apiVersion: batch/v1
-#kind: Job
-#  metadata:
-#  name: coalesce-printer
-#namespace: coalesce
-#  spec:
-#    ttlSecondsAfterFinished: 3600
-#    template:
-#      spec:
-#        restartPolicy: Never
-#        containers:
-#        - name: printer
-#          image: alpine
-#          command: ["sh", "-c", "for n in $(seq 1 10); do echo $n; sleep 1; done"]
+# TODO Make `:::` configurable, so if you need `:::` as an argument use `@@@`
+# instead, for example.
+function _coalesce_job_yaml {
+    typeset dag=${1:-}
+    shift
+    typeset job
+    heredoc -v job <<'    EOF'
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: null
+          namespace: null
+        spec:
+          backoffLimit: 0
+          ttlSecondsAfterFinished: 3600
+          template:
+            spec:
+              restartPolicy: Never
+              containers: []
+    EOF
+    typeset container containers=()
+    typeset args=() arg image
+    for arg in "${(@QA)${(z)_coalesce_node[${dag}:args]}}" ":::"; do
+        if [[ $arg = ":::" ]]; then
+            eval "$(args -@ -- "${(@)args}")"
+            image=${1:-}
+            shift
+            container=$(
+                gojq --yaml-input \
+                    --argjson args "$(jo \
+                        name=${dag//_/-} \
+                        image=$image \
+                        cmd="$(jo  -a -- "$@" < /dev/null)" \
+                 )" \
+                '
+                    .command = $args.cmd |
+                    .image = $args.image |
+                    .name = $args.name
+                ' <({
+                    heredoc <<'                    EOF'
+                        name: null
+                        image: null
+                        command: []
+                        env: []
+                        args: []
+                    EOF
+                })
+            )
+            containers+=( $container )
+        else
+            args+=( $arg )
+        fi
+    done
+    yaml[$dag]=$(
+        gojq --yaml-input --yaml-output \
+            --argjson args "$(jo \
+                name=${dag//_/.} \
+                namespace=default \
+                containers="$(jo  -a -- "${(@)containers}" < /dev/null)" \
+         )" \
+        '
+            .metadata.name = $args.name |
+            .metadata.namespace = $args.namespace |
+            .spec.template.spec.containers = $args.containers
+        '  <<< $job
+    )
+    # gojq -c --yaml-input <<< $yaml
+}
+
+function _coalesce_dag_check_job {
+    typeset job=${1:-}
+    shift
+    integer dirty
+    case $_coalesce[${job}:kind]:$_coalesce[${job}:parallel] in
+    (sync:0)
+        _coalesce_dag_descend_jobs ${job} || return 1
+        ;;
+    (sync:1)
+        for child in "${(@AQ)${(z)_coalesce[${job}:queue]}}"; do
+            _coalesce_dag_check_job ${job}.${child}
+            dirty=$?
+        done
+        (( dirty )) && return 1 || true
+        ;;
+    (pod:*)
+        if (( ! ${+_coalesce[${job}:done]} )); then
+            runnable+=( $job )
+            return 1
+        fi
+        ;;
+    esac
+}
+
+function _coalesce_dag_descend_jobs {
+    typeset dag=${1:-} queue=() node
+    shift
+    queue=( "${(@AQ)${(z)_coalesce[${dag}:queue]}}" )
+    for node in "${(@)queue}"; do
+        _coalesce_dag_check_job ${dag}.${node} || return 1
+    done
+}
+
+function _coalesce_dag_run {
+    typeset runnable=()
+    _coalesce[coalesce.gather:done]=1
+    _coalesce[coalesce.cdl:done]=1
+    _coalesce[coalesce.fanout.baz.frobinate.a:done]=1
+    _coalesce[coalesce.fanout.baz.frobinate.b:done]=1
+    _coalesce[coalesce.fanout.baz.frobinate.c:done]=1
+    _coalesce[coalesce.fanout.baz.frobinate.d:done]=1
+    _coalesce[coalesce.fanout.baz.fix:done]=1
+    _coalesce[coalesce.fanout.baz.stitch:done]=1
+    _coalesce_dag_descend_jobs coalesce
+    print -r "${(@)runnable}"
+    exit
+    _coalesce_dag_descend_queue coalesce
+    print -r "${(@kv)_coalesce}"
+}
 
 function _coalesce_dag_descend_json {
     typeset dag=${1:-} queue=() node
     shift
-    typeset parts=( "$@" )
-    queue=( "${(@AQ)${(z)_coalesce_node[$dag]}}" )
+    queue=( "${(@AQ)${(z)_coalesce[${dag}:queue]}}" )
     for node in "${(@)queue}"; do
-        case $_coalesce_node[${dag}_${node}:kind] in
+        case $_coalesce[${dag}.${node}:kind] in
         (sync)
-            jo -- name=$node under=${dag} kind=sync -b parallel=$_coalesce_node[${dag}_${node}:parallel]
-            _coalesce_dag_descend_json ${dag}-${node} "${(@)parts}" $node
+            jo -- name=$node under=${dag} kind=sync -b parallel=$_coalesce[${dag}.${node}:parallel]
+            _coalesce_dag_descend_json ${dag}.${node}
             ;;
         (pod)
             jo -- name=$node under=${dag} kind=node
@@ -46,29 +149,34 @@ function step {
     if [[ -v o_under ]]; then
         join=( coalesce "${(As:/:)o_under}" )
     fi
-    under="${(j:-:)join}"
+    under="${(j:.:)join}"
     if (( o_sync )); then
-        (( ${+_coalesce_node[$under]} )) || abend "no such node to put under"
-        _coalesce_node[$under-$o_name]=
-        queue=( "${(@AQ)${(z)_coalesce_node[$under]}}" )
+        (( ${+_coalesce[${under}:queue]} )) || abend "no such node to put under"
+        _coalesce[${under}.${o_name}:queue]=
+        queue=( "${(@AQ)${(z)_coalesce[${under}:queue]}}" )
         queue+=( $o_name )
-        _coalesce_node[$under]="${(@qq)queue}"
-        _coalesce_node[${under}_${o_name}:kind]=sync
-        _coalesce_node[${under}_${o_name}:parallel]=$o_parallel
+        _coalesce[${under}:queue]="${(@qq)queue}"
+        _coalesce[${under}.${o_name}:kind]=sync
+        _coalesce[${under}.${o_name}:parallel]=$o_parallel
     else
-        (( ${+_coalesce_node[$under]} )) || abend "no such node to put under"
+        (( ${+_coalesce[${under}:queue]} )) || abend "no such node to put under"
         typeset args=( "$@" )
         eval "$(args e,env -- "$@")"
-        queue=( "${(@AQ)${(z)_coalesce_node[$under]}}" )
+        queue=( "${(@AQ)${(z)_coalesce[${under}:queue]}}" )
         queue+=( $o_name )
-        _coalesce_node[$under]="${(@qq)queue}"
-        _coalesce_node[${under}_${o_name}:kind]=pod
-        _coalesce_node[${under}_${o_name}:args]=${(j: :)${(@qq)args}}
+        _coalesce[${under}:queue]="${(@qq)queue}"
+        _coalesce[${under}.${o_name}:kind]=pod
+        _coalesce[${under}.${o_name}:args]=${(j: :)${(@qq)args}}
     fi
 }
 
+function _coalesce_cksum {
+    typeset -i16 hex_var=$(printf '%s' ${1:-} | cksum | cut -d' ' -f1)
+    print ${hex_var[4,-1]:l}
+}
+
 function execute {
-    typeset -A _coalesce_node=( coalesce '' )
+    typeset -A _coalesce=( coalesce:queue '' )
     source $1
     _coalesce_dag_json | jq --slurp '
       . as $all |
@@ -80,7 +188,7 @@ function execute {
           children: [
             $all | find_children(
               if $path == null then $node.name
-              else $path + "-" + $node.name
+              else $path + "." + $node.name
               end
             )
           ]
