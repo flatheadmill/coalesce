@@ -1,5 +1,20 @@
 #!/usr/bin/env zshctl
 
+#apiVersion: batch/v1
+#kind: Job
+#  metadata:
+#  name: coalesce-printer
+#namespace: coalesce
+#  spec:
+#    ttlSecondsAfterFinished: 3600
+#    template:
+#      spec:
+#        restartPolicy: Never
+#        containers:
+#        - name: printer
+#          image: alpine
+#          command: ["sh", "-c", "for n in $(seq 1 10); do echo $n; sleep 1; done"]
+
 function _coalesce_dag_descend_json {
     typeset dag=${1:-} queue=() node
     shift

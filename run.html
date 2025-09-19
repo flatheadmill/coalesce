@@ -3,6 +3,8 @@
 <head>
     <title>Pipeline DAG - Coalesce</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
     <style>
         body {
             font-family: monospace;
@@ -24,12 +26,17 @@
             color: #b0b0b0;
             margin-top: 10px;
         }
+        #terminal {
+            margin-top: 20px;
+            border: 1px solid #444;
+        }
     </style>
 </head>
 <body>
     <h1>Pipeline DAG - Click nodes to see details</h1>
     <div id="cy"></div>
     <div class="info" id="info">Click a node to see: container image, environment variables</div>
+    <div id="terminal"></div>
 
     <script>
         // Pretend this came from server - output from bin/coalesce test/pipeline.coalesce.zsh
@@ -324,6 +331,59 @@
 
             document.getElementById('info').innerHTML = info;
         });
+
+        // Initialize xterm.js
+        const term = new Terminal({
+            rows: 30,
+            cols: 120,
+            theme: {
+                background: '#1e1e1e',
+                foreground: '#d4d4d4'
+            }
+        });
+        term.open(document.getElementById('terminal'));
+
+        // Test with hardcoded pod for now
+        const namespace = 'external-dns';
+        const pod = 'powerdns-fqn-sierra-54598f6569-b9bzq';
+        const container = 'external-dns';
+
+        // Connect to SSE endpoint
+        const eventSource = new EventSource(`/logs/${namespace}/${pod}/${container}`);
+
+        eventSource.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                switch(msg.kind) {
+                case 'line':
+                    term.writeln(msg.text);
+                    break;
+                case 'error':
+                    term.writeln(`\x1b[31mError: ${msg.text}\x1b[0m`);
+                    break;
+                case 'status':
+                    term.writeln(`\x1b[33mStatus: ${msg.phase}\x1b[0m`);
+                    break;
+                case 'exit':
+                    if (msg.exitCode === 0) {
+                        term.writeln(`\x1b[32mCompleted successfully\x1b[0m`);
+                    } else {
+                        term.writeln(`\x1b[31mExited with code ${msg.exitCode}: ${msg.reason}\x1b[0m`);
+                    }
+                    eventSource.close();
+                    break;
+                }
+            } catch (e) {
+                // Fallback for non-JSON data
+                term.writeln(event.data);
+            }
+        };
+
+        eventSource.onerror = (event) => {
+            console.log(event);
+            term.writeln('\x1b[31mConnection lost\x1b[0m');
+            eventSource.close();
+        };
     </script>
 </body>
 </html>
