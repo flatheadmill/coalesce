@@ -3,26 +3,11 @@
 # TODO Make `:::` configurable, so if you need `:::` as an argument use `@@@`
 # instead, for example.
 function _coalesce_job_yaml {
-    typeset dag=${1:-}
+    typeset job=${1:-}
     shift
-    typeset job
-    heredoc -v job <<'    EOF'
-        apiVersion: batch/v1
-        kind: Job
-        metadata:
-          name: null
-          namespace: null
-        spec:
-          backoffLimit: 0
-          ttlSecondsAfterFinished: 3600
-          template:
-            spec:
-              restartPolicy: Never
-              containers: []
-    EOF
     typeset container containers=()
     typeset args=() arg image
-    for arg in "${(@QA)${(z)_coalesce_node[${dag}:args]}}" ":::"; do
+    for arg in "${(@QA)${(z)_coalesce[${job}:args]}}" ":::"; do
         if [[ $arg = ":::" ]]; then
             eval "$(args -@ -- "${(@)args}")"
             image=${1:-}
@@ -30,7 +15,7 @@ function _coalesce_job_yaml {
             container=$(
                 gojq --yaml-input \
                     --argjson args "$(jo \
-                        name=${dag//_/-} \
+                        name=${job##*.} \
                         image=$image \
                         cmd="$(jo  -a -- "$@" < /dev/null)" \
                  )" \
@@ -53,39 +38,61 @@ function _coalesce_job_yaml {
             args+=( $arg )
         fi
     done
-    yaml[$dag]=$(
+    typeset name=${o_slug}-$(_coalesce_cksum $o_slug.$job)-${job##*.}
+    typeset labels=$(
+        jo -- flatheadmill.github.io/job=$job flatheadmill.github.io/slug=$o_slug
+    )
+    k8s[yaml]=$(
         gojq --yaml-input --yaml-output \
             --argjson args "$(jo \
-                name=${dag//_/.} \
+                name=$name \
+                labels=$labels \
                 namespace=default \
                 containers="$(jo  -a -- "${(@)containers}" < /dev/null)" \
          )" \
         '
             .metadata.name = $args.name |
             .metadata.namespace = $args.namespace |
+            .metadata.labels = $args.labels |
             .spec.template.spec.containers = $args.containers
-        '  <<< $job
+        '  <({
+            heredoc <<'            EOF'
+                apiVersion: batch/v1
+                kind: Job
+                metadata:
+                  name: null
+                  namespace: null
+                  labels: {}
+                spec:
+                  backoffLimit: 0
+                  ttlSecondsAfterFinished: 300
+                  template:
+                    spec:
+                      restartPolicy: Never
+                      containers: []
+            EOF
+        })
     )
     # gojq -c --yaml-input <<< $yaml
 }
 
-function _coalesce_dag_check_job {
-    typeset job=${1:-}
+function _coalesce_check_job {
+    typeset job=${1:-} child
     shift
     integer dirty
     case $_coalesce[${job}:kind]:$_coalesce[${job}:parallel] in
     (sync:0)
-        _coalesce_dag_descend_jobs ${job} || return 1
+        _coalesce_descend_jobs ${job} || return 1
         ;;
     (sync:1)
         for child in "${(@AQ)${(z)_coalesce[${job}:queue]}}"; do
-            _coalesce_dag_check_job ${job}.${child}
+            _coalesce_check_job ${job}.${child}
             dirty=$?
         done
         (( dirty )) && return 1 || true
         ;;
     (pod:*)
-        if (( ! ${+_coalesce[${job}:done]} )); then
+        if (( ! ${+_coalesce[${job}:over]} )); then
             runnable+=( $job )
             return 1
         fi
@@ -93,30 +100,98 @@ function _coalesce_dag_check_job {
     esac
 }
 
-function _coalesce_dag_descend_jobs {
+function _coalesce_descend_jobs {
     typeset dag=${1:-} queue=() node
     shift
     queue=( "${(@AQ)${(z)_coalesce[${dag}:queue]}}" )
     for node in "${(@)queue}"; do
-        _coalesce_dag_check_job ${dag}.${node} || return 1
+        _coalesce_check_job ${dag}.${node} || return 1
     done
 }
 
-function _coalesce_dag_run {
-    typeset runnable=()
-    _coalesce[coalesce.gather:done]=1
-    _coalesce[coalesce.cdl:done]=1
-    _coalesce[coalesce.fanout.baz.frobinate.a:done]=1
-    _coalesce[coalesce.fanout.baz.frobinate.b:done]=1
-    _coalesce[coalesce.fanout.baz.frobinate.c:done]=1
-    _coalesce[coalesce.fanout.baz.frobinate.d:done]=1
-    _coalesce[coalesce.fanout.baz.fix:done]=1
-    _coalesce[coalesce.fanout.baz.stitch:done]=1
-    _coalesce_dag_descend_jobs coalesce
-    print -r "${(@)runnable}"
-    exit
-    _coalesce_dag_descend_queue coalesce
-    print -r "${(@kv)_coalesce}"
+function _coalesce_run_start_jobs {
+    typeset job
+    typeset -A k8s
+    for job in "${(@)runnable}"; do
+        (( ${+_coalesce[${job}:ran]} )) && continue
+        _coalesce_job_yaml $job
+        # TODO Check with app if there is a metadata.json.
+        kubectl apply -f - <<< $k8s[yaml]
+        _coalesce[${job}:ran]=1
+    done
+}
+
+function _coalesce_run {
+    typeset runnable=() tape=()
+    typeset event_type key value outcome
+    typeset -A labels
+    _coalesce_descend_jobs coalesce
+    _coalesce_run_start_jobs
+    integer fd child entries completed over
+    while (( ! _coalesce[over] )); do
+        coproc kubectl get jobs -l flatheadmill.github.io/slug=$o_slug \
+            --watch --output-watch-events --output json
+        child=${!}
+        _coalesce_children+=( $child )
+        exec {fd}<&p;
+        coproc :
+        while read -r line; do
+            tape=( "${(@QA)${(z)$(
+                jq -r '[
+                    .type,
+                    (.object.metadata.name),
+                    (.object.metadata.namespace),
+                    (.object.metadata.labels | length),
+                    (.object.metadata.labels | to_entries[] | (.key, .value)),
+                    ((.object.status.conditions // [{}])[] | (.type // "Pending"))
+                ] | @sh'<<< $line
+            )}}" )
+            set -- "${(@)tape}"
+            event_type=${1:-} entries=${4:-}
+            shift 4
+            while (( entries-- )); do
+                key=${1:-} value=${2:-}
+                shift 2
+                labels[$key]=$value
+            done
+            outcome=${1:-}
+            shift
+            completed=0
+            case $outcome in
+            (Pending) ;;
+            (Failed) ;;
+            (Complete)
+                print complete $labels[flatheadmill.github.io/job]
+                completed=1
+                _coalesce[$labels[flatheadmill.github.io/job]:over]=1
+                ;;
+            esac
+            if (( completed )); then
+                runnable=()
+                _coalesce_descend_jobs coalesce
+                if (( ${#runnable} )); then
+                    _coalesce_run_start_jobs
+                else
+                    over=1
+                    for key in "${(@k)_coalesce}"; do
+                        [[ $key = *:ran ]] || continue
+                        if (( ! ${+_coalesce[${key%%:*}:over]} )); then
+                            over=0
+                            break
+                        fi
+                    done
+                    if (( over )); then
+                        kill $child
+                        wait $child
+                        _coalesce[over]=1
+                        break
+                    fi
+                fi
+            fi
+        done <&${fd}
+        _coalesce_children=()
+    done
+    print exiting
 }
 
 function _coalesce_dag_descend_json {
@@ -176,8 +251,20 @@ function _coalesce_cksum {
 }
 
 function execute {
-    typeset -A _coalesce=( coalesce:queue '' )
+    eval "$(args -s s,slug -- "$@")"
+    [[ -v o_slug ]] || abned 'slug is not defined'
+    typeset -A _coalesce=( coalesce:queue '' over 0 )
+    typeset _coalesce_children=()
+    function TRAPTERM {
+        typeset child
+        _coalesce[over]=1
+        for child in "${(@)_coalesce_children}"; do
+            kill $child
+        done
+    }
     source $1
+    _coalesce_run
+    exit
     _coalesce_dag_json | jq --slurp '
       . as $all |
       def find_children($path):
