@@ -1,5 +1,10 @@
 #!/usr/bin/env zshctl
 
+function _coalesce_cksum {
+    typeset -i16 hex_var=$(printf '%s' ${1:-} | cksum | cut -d' ' -f1)
+    print ${hex_var[4,-1]:l}
+}
+
 # TODO Make `:::` configurable, so if you need `:::` as an argument use `@@@`
 # instead, for example.
 function _coalesce_job_yaml {
@@ -76,37 +81,64 @@ function _coalesce_job_yaml {
     # gojq -c --yaml-input <<< $yaml
 }
 
-function _coalesce_check_job {
-    typeset job=${1:-} child
+function _coalesce_propagate_over {
+    typeset child=${1:-}
     shift
-    integer dirty
-    case $_coalesce[${job}:kind]:$_coalesce[${job}:parallel] in
-    (sync:0)
-        _coalesce_descend_jobs ${job} || return 1
-        ;;
-    (sync:1)
-        for child in "${(@AQ)${(z)_coalesce[${job}:queue]}}"; do
-            _coalesce_check_job ${job}.${child}
-            dirty=$?
-        done
-        (( dirty )) && return 1 || true
-        ;;
-    (pod:*)
-        if (( ! ${+_coalesce[${job}:over]} )); then
-            runnable+=( $job )
-            return 1
-        fi
-        ;;
-    esac
+    typeset parent=${child%.*}
+    print over $child $parent
+    ((_coalesce[${parent}:over]++))
+    typeset queue=( "${(@AQ)${(z)_coalesce[${parent}:queue]}}" )
+    if [[ $_coalesce[${parent}:over] -lt ${#queue} || $parent = coalesce ]]; then
+        return
+    fi
+    print ">>>" $parent $_coalesce[${parent}:over] ${#queue}
+    _coalesce_propagate_over $parent
 }
 
 function _coalesce_descend_jobs {
-    typeset dag=${1:-} queue=() node
+    typeset node=${1:-} queue=()
     shift
-    queue=( "${(@AQ)${(z)_coalesce[${dag}:queue]}}" )
-    for node in "${(@)queue}"; do
-        _coalesce_check_job ${dag}.${node} || return 1
-    done
+    queue=( "${(@AQ)${(z)_coalesce[${node}:queue]}}" )
+    if (( ${#queue} == _coalesce[${node}:over] )); then
+        return
+    fi
+    function {
+        typeset child
+        integer from=$(( _coalesce[${node}:over] + 1 ))
+        integer to=$(( _coalesce[${node}:started] + 1 ))
+        print $parent from: $from to: $to
+        while (( from < to )); do
+            child=${node}.${queue[$from]}
+            ((from++))
+            case $_coalesce[${child}:kind] in
+            (tranche)
+                _coalesce_descend_jobs $child
+                ;;
+            esac
+        done
+    }
+    function {
+        typeset child
+        integer offset=$(( _coalesce[${node}:started] + 1 ))
+        integer outstanding=$(( _coalesce[${node}:started] - _coalesce[${node}:over] ))
+        integer parallel=$_coalesce[${node}:parallel]
+        print $node outstanding: $outstanding parallel: $parallel \
+            offset: $offset outcome count: ${#queue}
+        while (( outstanding < parallel && offset <= ${#queue} )); do
+            child=${node}.${queue[$offset]}
+            ((offset++))
+            ((outstanding++))
+            ((_coalesce[${node}:started]++))
+            case $_coalesce[${child}:kind] in
+            (tranche)
+                _coalesce_descend_jobs $child
+                ;;
+            (pod)
+                runnable+=( $child )
+                ;;
+            esac
+        done
+    }
 }
 
 function _coalesce_run_start_jobs {
@@ -122,12 +154,23 @@ function _coalesce_run_start_jobs {
 }
 
 function _coalesce_run {
-    typeset runnable=() tape=()
-    typeset event_type key value outcome
+    typeset runnable=() tape=() outcomes=()
+    typeset line key value completed outcome_count outcome
     typeset -A labels
+    # TODO We an store the outcomes in PostgreSQL so that we are always able to
+    # resume pipelines, not matter how stale. If we load from PostgreSQL at this
+    # point here, we are loading states however old, pods may be collected, it
+    # is a starting state. We then move on to using events.
+    # TODO We probably have a race condition though, where we may have exited
+    # the program before a job finishes, so we never record that if finished, so
+    # we are going to re-run it. We can check this against PostgreSQL, though.
+    # We can track the programs we start and when they are over. If we have a
+    # started program that is not over, and its pod does not exist, then we have
+    # a lost job and we can abend. There can be a switch that allows for
+    # re-running lost jobs.
     _coalesce_descend_jobs coalesce
     _coalesce_run_start_jobs
-    integer fd child entries completed over
+    integer fd child entries over
     while (( ! _coalesce[over] )); do
         coproc kubectl get jobs -l flatheadmill.github.io/slug=$o_slug \
             --watch --output-watch-events --output json
@@ -136,37 +179,44 @@ function _coalesce_run {
         exec {fd}<&p;
         coproc :
         while read -r line; do
+            # TODO Array of conditions.
             tape=( "${(@QA)${(z)$(
-                jq -r '[
-                    .type,
-                    (.object.metadata.name),
-                    (.object.metadata.namespace),
-                    (.object.metadata.labels | length),
-                    (.object.metadata.labels | to_entries[] | (.key, .value)),
-                    ((.object.status.conditions // [{}])[] | (.type // "Pending"))
-                ] | @sh'<<< $line
+                jq -r '
+                    (.object.status.conditions // [{type:"Pending"}]) as $conditions |
+                    [
+                        (.object.metadata.labels | length),
+                        (.object.metadata.labels | to_entries[] | (.key, .value)),
+                        ($conditions | length),
+                        ($conditions[] | .type)
+                    ] | @sh
+                '<<< $line
             )}}" )
             set -- "${(@)tape}"
-            event_type=${1:-} entries=${4:-}
-            shift 4
+            entries=${1:-}
+            shift
             while (( entries-- )); do
                 key=${1:-} value=${2:-}
                 shift 2
                 labels[$key]=$value
             done
-            outcome=${1:-}
+            outcome_count=${1:-}
             shift
-            completed=0
-            case $outcome in
-            (Pending) ;;
-            (Failed) ;;
-            (Complete)
-                print complete $labels[flatheadmill.github.io/job]
-                completed=1
-                _coalesce[$labels[flatheadmill.github.io/job]:over]=1
-                ;;
-            esac
-            if (( completed )); then
+            outcomes=( "${(@)@[1,$outcome_count]}" )
+            shift $outcome_count
+            completed=
+            for outcome in "${(@)outcomes}"; do
+                case $outcome in
+                (Pending|SuccessCriteriaMet) ;;
+                (Failed) ;;
+                (Complete)
+                    completed=$labels[flatheadmill.github.io/job]
+                    print complete $completed
+                    _coalesce[${completed}:over]=1
+                    ;;
+                esac
+            done
+            if [[ ! -z $completed ]]; then
+                _coalesce_propagate_over $completed
                 runnable=()
                 _coalesce_descend_jobs coalesce
                 if (( ${#runnable} )); then
@@ -174,7 +224,6 @@ function _coalesce_run {
                 else
                     over=1
                     for key in "${(@k)_coalesce}"; do
-                        [[ $key = *:ran ]] || continue
                         if (( ! ${+_coalesce[${key%%:*}:over]} )); then
                             over=0
                             break
@@ -197,11 +246,13 @@ function _coalesce_run {
 function _coalesce_dag_descend_json {
     typeset dag=${1:-} queue=() node
     shift
+    integer parallel
     queue=( "${(@AQ)${(z)_coalesce[${dag}:queue]}}" )
     for node in "${(@)queue}"; do
         case $_coalesce[${dag}.${node}:kind] in
-        (sync)
-            jo -- name=$node under=${dag} kind=sync -b parallel=$_coalesce[${dag}.${node}:parallel]
+        (tranche)
+            parallel=$(( _coalesce[${dag}.${node}:parallel] != 1 ))
+            jo -- name=$node under=${dag} kind=tranche -b parallel=$parallel
             _coalesce_dag_descend_json ${dag}.${node}
             ;;
         (pod)
@@ -215,24 +266,29 @@ function _coalesce_dag_json {
     _coalesce_dag_descend_json coalesce
 }
 
-# TODO Global variables do not help, just serialize into an associative array
-# and then you can use `:` as a delimiter allowing the user to use snake case.
 function step {
     # first parse the placement args.
-    eval "$(args n,name u,under -b s,sync p,parallel -- "$@")"
+    eval "$(args n,name u,under p,parallel f,func -- "$@")"
     typeset node pod split=() under=() join=( coalesce ) queue=()
     if [[ -v o_under ]]; then
         join=( coalesce "${(As:/:)o_under}" )
     fi
     under="${(j:.:)join}"
-    if (( o_sync )); then
+    if [[ -v o_parallel ]]; then
+        # TODO Assert that parallel is an integer.
         (( ${+_coalesce[${under}:queue]} )) || abend "no such node to put under"
         _coalesce[${under}.${o_name}:queue]=
         queue=( "${(@AQ)${(z)_coalesce[${under}:queue]}}" )
         queue+=( $o_name )
         _coalesce[${under}:queue]="${(@qq)queue}"
-        _coalesce[${under}.${o_name}:kind]=sync
-        _coalesce[${under}.${o_name}:parallel]=$o_parallel
+        _coalesce[${under}.${o_name}:kind]=tranche
+        _coalesce[${under}.${o_name}:started]=0
+        _coalesce[${under}.${o_name}:over]=0
+        if (( ! o_parallel )); then
+            _coalesce[${under}.${o_name}:parallel]=$((2**63 - 1))
+        else
+            _coalesce[${under}.${o_name}:parallel]=$o_parallel
+        fi
     else
         (( ${+_coalesce[${under}:queue]} )) || abend "no such node to put under"
         typeset args=( "$@" )
@@ -245,15 +301,13 @@ function step {
     fi
 }
 
-function _coalesce_cksum {
-    typeset -i16 hex_var=$(printf '%s' ${1:-} | cksum | cut -d' ' -f1)
-    print ${hex_var[4,-1]:l}
+function :args {
+    eval "$(args -s s,slug -- "$@")"
 }
 
-function execute {
-    eval "$(args -s s,slug -- "$@")"
+function :execute {
     [[ -v o_slug ]] || abned 'slug is not defined'
-    typeset -A _coalesce=( coalesce:queue '' over 0 )
+    typeset -A _coalesce=( coalesce:queue '' coalesce:over 0 coalesce:parallel 1 )
     typeset _coalesce_children=()
     function TRAPTERM {
         typeset child
@@ -264,6 +318,8 @@ function execute {
     }
     source $1
     _coalesce_run
+    exit
+    _coalesce_dag_json
     exit
     _coalesce_dag_json | jq --slurp '
       . as $all |
