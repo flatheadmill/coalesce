@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
+	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,9 +11,16 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/gorilla/websocket"
+	_ "github.com/lib/pq"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -22,7 +31,13 @@ import (
 	"k8s.io/client-go/util/homedir"
 )
 
-var clientset *kubernetes.Clientset
+var (
+	clientset *kubernetes.Clientset
+	db        *sql.DB
+)
+
+//go:embed migrations/*.sql
+var migrations embed.FS
 
 type LogMessage struct {
 	Kind     string `json:"kind"`               // "line", "error", "status", "exit"
@@ -59,6 +74,18 @@ func (sse *SSEWriter) Write(data string) {
 func (sse *SSEWriter) WriteJSON(msg LogMessage) {
 	data, _ := json.Marshal(msg)
 	sse.Write(string(data))
+}
+
+var upgrader = websocket.Upgrader{}
+
+func handleEvents(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+  slug := strings.TrimPrefix(r.URL.Path, "/events/")
+  conn.WriteJSON(LogMessage{Kind: "status", Phase: "connected", Reason: slug})
 }
 
 func handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -316,6 +343,28 @@ func main() {
 	flag.IntVar(&port, "port", 8080, "port to serve on")
 	flag.Parse()
 
+	// Build database connection string from environment variables
+	dbURL := buildDatabaseURL()
+
+	// Initialize database connection
+	var err error
+	db, err = sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer db.Close()
+
+	// Test database connection
+	if err := testDatabaseConnection(); err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	// Skip migrations for now - just testing mTLS
+	slog.Info("Skipping migrations for mTLS testing")
+	// if err := runMigrations(dbURL); err != nil {
+	// 	log.Fatalf("Failed to run migrations: %v", err)
+	// }
+
 	// Try in-cluster config first, fall back to kubeconfig
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -341,6 +390,7 @@ func main() {
 	http.HandleFunc("/graph/", handleGraph)
 	http.HandleFunc("/run/", handleRun)
 	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/events/", handleEvents)
 
 	// Serve static files from current directory
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("."))))
@@ -351,4 +401,180 @@ func main() {
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
+}
+
+func buildDatabaseURL() string {
+	// Check if full DATABASE_URL is provided
+	if url := os.Getenv("DATABASE_URL"); url != "" {
+		return url
+	}
+
+	// Build from individual components
+	host := os.Getenv("DB_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+
+	port := os.Getenv("DB_PORT")
+	if port == "" {
+		port = "5432"
+	}
+
+	user := os.Getenv("DB_USER")
+	if user == "" {
+		user = "postgres"
+	}
+
+	password := os.Getenv("DB_PASSWORD")
+	if password == "" {
+		password = "postgres"
+	}
+
+	dbname := os.Getenv("DB_NAME")
+	if dbname == "" {
+		dbname = "coalesce"
+	}
+
+	sslmode := os.Getenv("DB_SSLMODE")
+	if sslmode == "" {
+		sslmode = "disable"
+	}
+
+	// Build connection string
+	url := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
+		user, password, host, port, dbname, sslmode)
+
+	// Add SSL cert parameters if provided
+	sslcert := os.Getenv("DB_SSLCERT")
+	sslkey := os.Getenv("DB_SSLKEY")
+	sslrootcert := os.Getenv("DB_SSLROOTCERT")
+
+	if sslcert != "" {
+		url += "&sslcert=" + sslcert
+		// Check if file exists
+		if _, err := os.Stat(sslcert); err != nil {
+			slog.Warn("SSL cert file not accessible", "path", sslcert, "error", err)
+		}
+	}
+	if sslkey != "" {
+		url += "&sslkey=" + sslkey
+		// Check if file exists
+		if _, err := os.Stat(sslkey); err != nil {
+			slog.Warn("SSL key file not accessible", "path", sslkey, "error", err)
+		}
+	}
+	if sslrootcert != "" {
+		url += "&sslrootcert=" + sslrootcert
+		// Check if file exists
+		if _, err := os.Stat(sslrootcert); err != nil {
+			slog.Warn("SSL root cert file not accessible", "path", sslrootcert, "error", err)
+		}
+	}
+
+	slog.Info("Database connection configured",
+		"host", host,
+		"port", port,
+		"user", user,
+		"database", dbname,
+		"sslmode", sslmode,
+		"sslcert", sslcert,
+		"sslkey", sslkey,
+		"sslrootcert", sslrootcert)
+
+	return url
+}
+
+func runMigrations(dbURL string) error {
+	slog.Info("Running database migrations")
+
+	source, err := iofs.New(migrations, "migrations")
+	if err != nil {
+		return fmt.Errorf("failed to create migration source: %w", err)
+	}
+
+	m, err := migrate.NewWithSourceInstance("iofs", source, dbURL)
+	if err != nil {
+		return fmt.Errorf("failed to create migrate instance: %w", err)
+	}
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		return fmt.Errorf("failed to run migrations: %w", err)
+	}
+
+	slog.Info("Database migrations completed")
+	return nil
+}
+
+// Database helper functions
+
+func createRun(slug, pipeline string) error {
+	_, err := db.Exec(`
+		INSERT INTO runs (slug, pipeline)
+		VALUES ($1, $2)
+	`, slug, pipeline)
+	return err
+}
+
+func createJob(slug, job, k8sName string) error {
+	_, err := db.Exec(`
+		INSERT INTO jobs (slug, job, k8s_name)
+		VALUES ($1, $2, $3)
+	`, slug, job, k8sName)
+	return err
+}
+
+func updateJobStatus(slug, job, status string, exitCode *int) error {
+	if exitCode != nil {
+		_, err := db.Exec(`
+			UPDATE jobs
+			SET status = $1, exit_code = $2, completed_at = now()
+			WHERE slug = $3 AND job = $4
+		`, status, *exitCode, slug, job)
+		return err
+	}
+	_, err := db.Exec(`
+		UPDATE jobs
+		SET status = $1, completed_at = now()
+		WHERE slug = $2 AND job = $3
+	`, status, slug, job)
+	return err
+}
+
+func saveLogs(slug, job, content string) error {
+	_, err := db.Exec(`
+		INSERT INTO logs (slug, job, content)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (slug, job)
+		DO UPDATE SET content = $3
+	`, slug, job, content)
+	return err
+}
+
+func testDatabaseConnection() error {
+	var version string
+	var user string
+	var ssl string
+
+	err := db.QueryRow("SELECT version()").Scan(&version)
+	if err != nil {
+		return fmt.Errorf("failed to query version: %w", err)
+	}
+
+	err = db.QueryRow("SELECT current_user").Scan(&user)
+	if err != nil {
+		return fmt.Errorf("failed to query current user: %w", err)
+	}
+
+	err = db.QueryRow("SELECT current_setting('ssl_cert_file', true)").Scan(&ssl)
+	if err != nil {
+		// Not critical if this fails
+		ssl = "unknown"
+	}
+
+	slog.Info("Database connection successful",
+		"version", version,
+		"current_user", user,
+		"ssl_cert", ssl)
+
+	return nil
 }

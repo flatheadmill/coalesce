@@ -343,46 +343,40 @@
         });
         term.open(document.getElementById('terminal'));
 
-        // Test with hardcoded pod for now
-        const namespace = 'external-dns';
-        const pod = 'powerdns-fqn-sierra-54598f6569-b9bzq';
-        const container = 'external-dns';
+        // Connect to WebSocket
+        const slug = 'test-slug';
+        const ws = new WebSocket(`ws://${location.host}/events/${slug}`);
 
-        // Connect to SSE endpoint
-        const eventSource = new EventSource(`/logs/${namespace}/${pod}/${container}`);
-
-        eventSource.onmessage = (event) => {
-            try {
-                const msg = JSON.parse(event.data);
-                switch(msg.kind) {
-                case 'line':
-                    term.writeln(msg.text);
-                    break;
-                case 'error':
-                    term.writeln(`\x1b[31mError: ${msg.text}\x1b[0m`);
-                    break;
-                case 'status':
-                    term.writeln(`\x1b[33mStatus: ${msg.phase}\x1b[0m`);
-                    break;
-                case 'exit':
-                    if (msg.exitCode === 0) {
-                        term.writeln(`\x1b[32mCompleted successfully\x1b[0m`);
-                    } else {
-                        term.writeln(`\x1b[31mExited with code ${msg.exitCode}: ${msg.reason}\x1b[0m`);
-                    }
-                    eventSource.close();
-                    break;
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            switch(msg.kind) {
+            case 'line':
+                term.writeln(msg.text);
+                break;
+            case 'error':
+                term.writeln(`\x1b[31mError: ${msg.text}\x1b[0m`);
+                break;
+            case 'status':
+                term.writeln(`\x1b[33mStatus: ${msg.phase}\x1b[0m`);
+                break;
+            case 'exit':
+                if (msg.exitCode === 0) {
+                    term.writeln(`\x1b[32mCompleted successfully\x1b[0m`);
+                } else {
+                    term.writeln(`\x1b[31mExited with code ${msg.exitCode}: ${msg.reason}\x1b[0m`);
                 }
-            } catch (e) {
-                // Fallback for non-JSON data
-                term.writeln(event.data);
+                ws.close();
+                break;
             }
         };
 
-        eventSource.onerror = (event) => {
+        ws.onerror = (event) => {
             console.log(event);
-            term.writeln('\x1b[31mConnection lost\x1b[0m');
-            eventSource.close();
+            term.writeln('\x1b[31mConnection error\x1b[0m');
+        };
+
+        ws.onclose = (event) => {
+            term.writeln('\x1b[33mConnection closed\x1b[0m');
         };
     </script>
 </body>
