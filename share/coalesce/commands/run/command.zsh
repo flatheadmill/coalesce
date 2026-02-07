@@ -1,9 +1,4 @@
-#!/usr/bin/env zshctl
-
-function _coalesce_cksum {
-    typeset -i16 hex_var=$(printf '%s' ${1:-} | cksum | cut -d' ' -f1)
-    print ${hex_var[4,-1]:l}
-}
+#!/usr/bin/env zsh
 
 # TODO Make `:::` configurable, so if you need `:::` as an argument use `@@@`
 # instead, for example.
@@ -78,7 +73,6 @@ function _coalesce_job_yaml {
             EOF
         })
     )
-    # gojq -c --yaml-input <<< $yaml
 }
 
 function _coalesce_propagate_over {
@@ -157,17 +151,6 @@ function _coalesce_run {
     typeset runnable=() tape=() outcomes=()
     typeset line key value completed outcome_count outcome
     typeset -A labels
-    # TODO We an store the outcomes in PostgreSQL so that we are always able to
-    # resume pipelines, not matter how stale. If we load from PostgreSQL at this
-    # point here, we are loading states however old, pods may be collected, it
-    # is a starting state. We then move on to using events.
-    # TODO We probably have a race condition though, where we may have exited
-    # the program before a job finishes, so we never record that if finished, so
-    # we are going to re-run it. We can check this against PostgreSQL, though.
-    # We can track the programs we start and when they are over. If we have a
-    # started program that is not over, and its pod does not exist, then we have
-    # a lost job and we can abend. There can be a switch that allows for
-    # re-running lost jobs.
     _coalesce_descend_jobs coalesce
     _coalesce_run_start_jobs
     integer fd child entries over
@@ -179,7 +162,6 @@ function _coalesce_run {
         exec {fd}<&p;
         coproc :
         while read -r line; do
-            # TODO Array of conditions.
             tape=( "${(@QA)${(z)$(
                 jq -r '
                     (.object.status.conditions // [{type:"Pending"}]) as $conditions |
@@ -243,72 +225,11 @@ function _coalesce_run {
     print exiting
 }
 
-function _coalesce_dag_descend_json {
-    typeset dag=${1:-} queue=() node
-    shift
-    integer parallel
-    queue=( "${(@AQ)${(z)_coalesce[${dag}:queue]}}" )
-    for node in "${(@)queue}"; do
-        case $_coalesce[${dag}.${node}:kind] in
-        (tranche)
-            parallel=$(( _coalesce[${dag}.${node}:parallel] != 1 ))
-            jo -- name=$node under=${dag} kind=tranche -b parallel=$parallel
-            _coalesce_dag_descend_json ${dag}.${node}
-            ;;
-        (pod)
-            jo -- name=$node under=${dag} kind=node
-            ;;
-        esac
-    done
+function :args:coalesce:run {
+    eval "$(args -bx h,help -- "$@")"
 }
 
-function _coalesce_dag_json {
-    _coalesce_dag_descend_json coalesce
-}
-
-function step {
-    # first parse the placement args.
-    eval "$(args n,name u,under p,parallel f,func -- "$@")"
-    typeset node pod split=() under=() join=( coalesce ) queue=()
-    if [[ -v o_under ]]; then
-        join=( coalesce "${(As:/:)o_under}" )
-    fi
-    under="${(j:.:)join}"
-    if [[ -v o_parallel ]]; then
-        # TODO Assert that parallel is an integer.
-        (( ${+_coalesce[${under}:queue]} )) || abend "no such node to put under"
-        _coalesce[${under}.${o_name}:queue]=
-        queue=( "${(@AQ)${(z)_coalesce[${under}:queue]}}" )
-        queue+=( $o_name )
-        _coalesce[${under}:queue]="${(@qq)queue}"
-        _coalesce[${under}.${o_name}:kind]=tranche
-        _coalesce[${under}.${o_name}:started]=0
-        _coalesce[${under}.${o_name}:over]=0
-        if (( ! o_parallel )); then
-            _coalesce[${under}.${o_name}:parallel]=$((2**63 - 1))
-        else
-            _coalesce[${under}.${o_name}:parallel]=$o_parallel
-        fi
-    else
-        (( ${+_coalesce[${under}:queue]} )) || abend "no such node to put under"
-        typeset args=( "$@" )
-        eval "$(args e,env -- "$@")"
-        queue=( "${(@AQ)${(z)_coalesce[${under}:queue]}}" )
-        queue+=( $o_name )
-        _coalesce[${under}:queue]="${(@qq)queue}"
-        _coalesce[${under}.${o_name}:kind]=pod
-        _coalesce[${under}.${o_name}:args]=${(j: :)${(@qq)args}}
-    fi
-}
-
-function :args {
-    eval "$(args -s s,slug -- "$@")"
-}
-
-function :execute {
-    [[ -v o_slug ]] || abend 'slug is not defined'
-    typeset -A _coalesce=( coalesce:queue '' coalesce:over 0 coalesce:parallel 1 )
-    typeset _coalesce_children=()
+function :execute:coalesce:run {
     function TRAPTERM {
         typeset child
         _coalesce[over]=1
@@ -316,29 +237,7 @@ function :execute {
             kill $child
         done
     }
+    _coalesce_init
     source $1
     _coalesce_run
-    exit
-    _coalesce_dag_json
-    exit
-    _coalesce_dag_json | jq --slurp '
-      . as $all |
-      def find_children($path):
-        $all[] |
-        select(.under == $path) |
-        . as $node |
-        . + {
-          children: [
-            $all | find_children(
-              if $path == null then $node.name
-              else $path + "." + $node.name
-              end
-            )
-          ]
-        };
-
-      [find_children("coalesce")]
-    '
 }
-
-# vim: ft=zsh :
