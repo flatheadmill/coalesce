@@ -225,11 +225,11 @@ function _coalesce_run {
     print exiting
 }
 
-function :args:coalesce:run {
+function :args:run {
     eval "$(args -bx h,help -- "$@")"
 }
 
-function :execute:coalesce:run {
+function :execute:run {
     function TRAPTERM {
         typeset child
         _coalesce[over]=1

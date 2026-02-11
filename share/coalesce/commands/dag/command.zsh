@@ -23,11 +23,11 @@ function _coalesce_dag_json {
     _coalesce_dag_descend_json coalesce
 }
 
-function :args:coalesce:dag {
+function :args:dag {
     eval "$(args -bx h,help -- "$@")"
 }
 
-function :execute:coalesce:dag {
+function :execute:dag {
     _coalesce_init
     source $1
     _coalesce_dag_json | jq --slurp '
