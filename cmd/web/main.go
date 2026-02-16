@@ -1,7 +1,14 @@
+// The Go server is a cubbyhole for the executor's state — persistence for
+// resumption, not orchestration source of truth. The Zsh executor owns the
+// logic: it builds DAGs, creates Kubernetes Jobs, watches completion, and
+// propagates state. This server observes and records: metadata to PostgreSQL,
+// logs to cloud buckets via Stow, events to the UI via WebSocket.
+//
+// The executor doesn't need this server to run a pipeline. This server
+// doesn't orchestrate. Clean separation.
 package main
 
 import (
-	"bufio"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -14,17 +21,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/gorilla/websocket"
+	"github.com/graymeta/stow"
+	"github.com/graymeta/stow/local"
 	_ "github.com/lib/pq"
 
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -32,298 +39,568 @@ import (
 )
 
 var (
-	clientset *kubernetes.Clientset
-	db        *sql.DB
+	clientset     *kubernetes.Clientset
+	db            *sql.DB
+	stowLocation  stow.Location
+	stowContainer stow.Container
 )
 
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-type LogMessage struct {
-	Kind     string `json:"kind"`               // "line", "error", "status", "exit"
-	Text     string `json:"text,omitempty"`     // For line and error
-	Phase    string `json:"phase,omitempty"`    // For status
-	ExitCode int    `json:"exitCode,omitempty"` // For exit
-	Reason   string `json:"reason,omitempty"`   // For exit and errors
+// WebSocket event types
+type Event struct {
+	Kind string      `json:"kind"` // "job_started", "job_completed", "job_failed", "log_line", "dag_updated"
+	Data interface{} `json:"data"`
 }
 
-type SSEWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
+// Event hub for WebSocket broadcasting
+type EventHub struct {
+	mu          sync.RWMutex
+	subscribers map[string]map[chan Event]bool // namespace/slug -> channels
 }
 
-func NewSSEWriter(w http.ResponseWriter) (*SSEWriter, error) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return nil, fmt.Errorf("streaming not supported")
+var hub = &EventHub{
+	subscribers: make(map[string]map[chan Event]bool),
+}
+
+func (h *EventHub) Subscribe(namespace, slug string) chan Event {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	key := namespace + "/" + slug
+	if h.subscribers[key] == nil {
+		h.subscribers[key] = make(map[chan Event]bool)
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	return &SSEWriter{w: w, flusher: flusher}, nil
+	ch := make(chan Event, 16)
+	h.subscribers[key][ch] = true
+	return ch
 }
 
-func (sse *SSEWriter) Write(data string) {
-	fmt.Fprintf(sse.w, "data: %s\n\n", strings.ReplaceAll(data, "\n", "\ndata: "))
-	sse.flusher.Flush()
+func (h *EventHub) Unsubscribe(namespace, slug string, ch chan Event) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	key := namespace + "/" + slug
+	if h.subscribers[key] != nil {
+		delete(h.subscribers[key], ch)
+		close(ch)
+	}
 }
 
-func (sse *SSEWriter) WriteJSON(msg LogMessage) {
-	data, _ := json.Marshal(msg)
-	sse.Write(string(data))
+func (h *EventHub) Broadcast(namespace, slug string, event Event) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	key := namespace + "/" + slug
+	for ch := range h.subscribers[key] {
+		select {
+		case ch <- event:
+		default:
+			// Drop if channel is full
+		}
+	}
 }
 
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+// API request/response types
+
+type DAGRequest struct {
+	DAG json.RawMessage `json:"dag"`
+}
+
+type RunRequest struct {
+	Pipeline string `json:"pipeline"`
+}
+
+type RunUpdateRequest struct {
+	Status string `json:"status"`
+}
+
+type JobStartRequest struct {
+	StartedAt time.Time `json:"started_at,omitempty"`
+}
+
+type JobUpdateRequest struct {
+	Status   string `json:"status"`
+	ExitCode *int   `json:"exit_code,omitempty"`
+}
+
+type ContainerLogRequest struct {
+	StartedAt time.Time `json:"started_at"`
+}
+
+// Executor-facing handlers
+
+func handlePostDAG(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+
+	var req DAGRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Versioned DAGs: compare to latest and only insert if different. This
+	// handles the data science case where someone adds steps mid-run to a
+	// $7,000 pipeline.
+	var latestDAG []byte
+	err := db.QueryRow(`
+		SELECT dag FROM dags
+		WHERE namespace = $1 AND slug = $2
+		ORDER BY created_at DESC LIMIT 1
+	`, namespace, slug).Scan(&latestDAG)
+
+	if err == sql.ErrNoRows || string(latestDAG) != string(req.DAG) {
+		_, err = db.Exec(`
+			INSERT INTO dags (namespace, slug, dag)
+			VALUES ($1, $2, $3)
+		`, namespace, slug, req.DAG)
+		if err != nil {
+			slog.Error("Failed to insert DAG", "error", err)
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
+		slog.Info("DAG inserted", "namespace", namespace, "slug", slug)
+
+		hub.Broadcast(namespace, slug, Event{Kind: "dag_updated", Data: map[string]string{
+			"namespace": namespace,
+			"slug":      slug,
+		}})
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func handlePostRun(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+
+	var req RunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// ON CONFLICT handles the resume case: a $12,000 data science pipeline
+	// fails, you fix the bucket name and re-run with the same slug. We
+	// preserve started_at so SOC 2 evidence shows the original start time,
+	// not the resumption time. Only status, completed_at, and pipeline are
+	// updated. For CI/CD, use unique slugs per invocation and this path
+	// never fires.
+	_, err := db.Exec(`
+		INSERT INTO runs (namespace, slug, pipeline)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (namespace, slug) DO UPDATE SET
+			completed_at = NULL,
+			status = 'running',
+			pipeline = $3
+	`, namespace, slug, req.Pipeline)
+
+	if err != nil {
+		slog.Error("Failed to create run", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("Run created", "namespace", namespace, "slug", slug, "pipeline", req.Pipeline)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"status": "created"})
+}
+
+// handlePutRun marks a pipeline run as done. This is the SOC 2 money shot:
+// "the scan ran and completed." Without this, the server can record individual
+// jobs but can't say the pipeline finished.
+func handlePutRun(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+
+	var req RunUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.Status != "completed" && req.Status != "failed" && req.Status != "cancelled" {
+		http.Error(w, "Status must be completed, failed, or cancelled", http.StatusBadRequest)
+		return
+	}
+
+	result, err := db.Exec(`
+		UPDATE runs
+		SET status = $1, completed_at = now()
+		WHERE namespace = $2 AND slug = $3
+	`, req.Status, namespace, slug)
+
+	if err != nil {
+		slog.Error("Failed to update run", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		http.Error(w, "Run not found", http.StatusNotFound)
+		return
+	}
+
+	hub.Broadcast(namespace, slug, Event{Kind: "run_" + req.Status, Data: map[string]string{
+		"namespace": namespace,
+		"slug":      slug,
+		"status":    req.Status,
+	}})
+
+	slog.Info("Run completed", "namespace", namespace, "slug", slug, "status", req.Status)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+}
+
+func handlePostJob(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+	job := r.PathValue("job")
+
+	var req JobStartRequest
+	json.NewDecoder(r.Body).Decode(&req) // Optional body
+
+	startedAt := req.StartedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+
+	_, err := db.Exec(`
+		INSERT INTO jobs (namespace, slug, job, started_at, status)
+		VALUES ($1, $2, $3, $4, 'running')
+	`, namespace, slug, job, startedAt)
+
+	if err != nil {
+		slog.Error("Failed to create job", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	hub.Broadcast(namespace, slug, Event{Kind: "job_started", Data: map[string]string{
+		"job": job,
+	}})
+
+	slog.Info("Job started", "namespace", namespace, "slug", slug, "job", job)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"status": "created"})
+}
+
+func handlePutJob(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+	job := r.PathValue("job")
+
+	var req JobUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	var err error
+	if req.ExitCode != nil {
+		_, err = db.Exec(`
+			UPDATE jobs
+			SET status = $1, exit_code = $2, completed_at = now()
+			WHERE namespace = $3 AND slug = $4 AND job = $5
+			AND completed_at IS NULL
+		`, req.Status, *req.ExitCode, namespace, slug, job)
+	} else {
+		_, err = db.Exec(`
+			UPDATE jobs
+			SET status = $1, completed_at = now()
+			WHERE namespace = $2 AND slug = $3 AND job = $4
+			AND completed_at IS NULL
+		`, req.Status, namespace, slug, job)
+	}
+
+	if err != nil {
+		slog.Error("Failed to update job", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	eventKind := "job_completed"
+	if req.Status == "failed" {
+		eventKind = "job_failed"
+	}
+	hub.Broadcast(namespace, slug, Event{Kind: eventKind, Data: map[string]interface{}{
+		"job":       job,
+		"status":    req.Status,
+		"exit_code": req.ExitCode,
+	}})
+
+	slog.Info("Job updated", "namespace", namespace, "slug", slug, "job", job, "status", req.Status)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+}
+
+func handlePostContainer(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+	job := r.PathValue("job")
+	container := r.PathValue("container")
+
+	// Get started_at from query param or use now
+	startedAtStr := r.URL.Query().Get("started_at")
+	var startedAt time.Time
+	if startedAtStr != "" {
+		var err error
+		startedAt, err = time.Parse(time.RFC3339, startedAtStr)
+		if err != nil {
+			http.Error(w, "Invalid started_at format", http.StatusBadRequest)
+			return
+		}
+	} else {
+		startedAt = time.Now()
+	}
+
+	// Read log content from body
+	logContent, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	// Logs go to cloud buckets via Stow, not PostgreSQL. Stow abstracts
+	// GCS/S3/local with the same API — swap the dial string and config to
+	// switch backends. The database just stores the path.
+	logPath := fmt.Sprintf("%s/%s/%s/%s/%s.log",
+		namespace, slug, job, startedAt.Format("20060102-150405"), container)
+
+	_, err = stowContainer.Put(logPath, strings.NewReader(string(logContent)), int64(len(logContent)), nil)
+	if err != nil {
+		slog.Error("Failed to store log", "error", err, "path", logPath)
+		http.Error(w, "Storage error", http.StatusInternalServerError)
+		return
+	}
+
+	// Record in database
+	_, err = db.Exec(`
+		INSERT INTO containers (namespace, slug, job, started_at, container, log_path)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (namespace, slug, job, started_at, container) DO UPDATE SET
+			log_path = $6
+	`, namespace, slug, job, startedAt, container, logPath)
+
+	if err != nil {
+		slog.Error("Failed to record container", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("Container log stored", "namespace", namespace, "slug", slug, "job", job, "container", container)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"status": "created", "log_path": logPath})
+}
+
+// UI-facing handlers
+
+func handleGetRuns(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+
+	rows, err := db.Query(`
+		SELECT slug, pipeline, started_at, completed_at, status
+		FROM runs
+		WHERE namespace = $1
+		ORDER BY started_at DESC
+		LIMIT 100
+	`, namespace)
+	if err != nil {
+		slog.Error("Failed to query runs", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type Run struct {
+		Slug        string     `json:"slug"`
+		Pipeline    string     `json:"pipeline"`
+		StartedAt   time.Time  `json:"started_at"`
+		CompletedAt *time.Time `json:"completed_at,omitempty"`
+		Status      string     `json:"status"`
+	}
+
+	var runs []Run
+	for rows.Next() {
+		var run Run
+		if err := rows.Scan(&run.Slug, &run.Pipeline, &run.StartedAt, &run.CompletedAt, &run.Status); err != nil {
+			continue
+		}
+		runs = append(runs, run)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(runs)
+}
+
+func handleGetRun(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+
+	type Job struct {
+		Job         string     `json:"job"`
+		StartedAt   time.Time  `json:"started_at"`
+		CompletedAt *time.Time `json:"completed_at,omitempty"`
+		Status      string     `json:"status"`
+		ExitCode    *int       `json:"exit_code,omitempty"`
+	}
+
+	type RunDetail struct {
+		Slug        string     `json:"slug"`
+		Pipeline    string     `json:"pipeline"`
+		StartedAt   time.Time  `json:"started_at"`
+		CompletedAt *time.Time `json:"completed_at,omitempty"`
+		Status      string     `json:"status"`
+		Jobs        []Job      `json:"jobs"`
+	}
+
+	var run RunDetail
+	err := db.QueryRow(`
+		SELECT slug, pipeline, started_at, completed_at, status
+		FROM runs
+		WHERE namespace = $1 AND slug = $2
+	`, namespace, slug).Scan(&run.Slug, &run.Pipeline, &run.StartedAt, &run.CompletedAt, &run.Status)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "Run not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		slog.Error("Failed to query run", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT job, started_at, completed_at, status, exit_code
+		FROM jobs
+		WHERE namespace = $1 AND slug = $2
+		ORDER BY started_at
+	`, namespace, slug)
+	if err != nil {
+		slog.Error("Failed to query jobs", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(&job.Job, &job.StartedAt, &job.CompletedAt, &job.Status, &job.ExitCode); err != nil {
+			continue
+		}
+		run.Jobs = append(run.Jobs, job)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(run)
+}
+
+func handleGetDAG(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+
+	var dag []byte
+	var createdAt time.Time
+	err := db.QueryRow(`
+		SELECT dag, created_at FROM dags
+		WHERE namespace = $1 AND slug = $2
+		ORDER BY created_at DESC LIMIT 1
+	`, namespace, slug).Scan(&dag, &createdAt)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "DAG not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		slog.Error("Failed to query DAG", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"dag":        json.RawMessage(dag),
+		"created_at": createdAt,
+	})
+}
+
+func handleGetLogs(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+	job := r.PathValue("job")
+	container := r.PathValue("container")
+
+	// Find the log path
+	var logPath string
+	err := db.QueryRow(`
+		SELECT log_path FROM containers
+		WHERE namespace = $1 AND slug = $2 AND job = $3 AND container = $4
+		ORDER BY started_at DESC LIMIT 1
+	`, namespace, slug, job, container).Scan(&logPath)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "Log not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		slog.Error("Failed to query log path", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	// Retrieve from Stow
+	item, err := stowContainer.Item(logPath)
+	if err != nil {
+		slog.Error("Failed to get log item", "error", err, "path", logPath)
+		http.Error(w, "Storage error", http.StatusInternalServerError)
+		return
+	}
+
+	reader, err := item.Open()
+	if err != nil {
+		slog.Error("Failed to open log", "error", err)
+		http.Error(w, "Storage error", http.StatusInternalServerError)
+		return
+	}
+	defer reader.Close()
+
+	w.Header().Set("Content-Type", "text/plain")
+	io.Copy(w, reader)
+}
 
 func handleEvents(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		slog.Error("WebSocket upgrade failed", "error", err)
 		return
 	}
 	defer conn.Close()
-  slug := strings.TrimPrefix(r.URL.Path, "/events/")
-  conn.WriteJSON(LogMessage{Kind: "status", Phase: "connected", Reason: slug})
-}
 
-func handleLogs(w http.ResponseWriter, r *http.Request) {
-	slog.Info("handleLogs called", "path", r.URL.Path, "method", r.Method)
+	ch := hub.Subscribe(namespace, slug)
+	defer hub.Unsubscribe(namespace, slug, ch)
 
-	// Extract pod and container from URL: /logs/{namespace}/{pod}/{container}
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 5 {
-		slog.Warn("Invalid path format", "path", r.URL.Path, "parts", len(parts))
-		http.Error(w, "Invalid path format. Expected /logs/{namespace}/{pod}/{container}", http.StatusBadRequest)
-		return
-	}
+	// Send connected event
+	conn.WriteJSON(Event{Kind: "connected", Data: map[string]string{
+		"namespace": namespace,
+		"slug":      slug,
+	}})
 
-	namespace := parts[2]
-	podName := parts[3]
-	containerName := parts[4]
-	follow := r.URL.Query().Get("follow") != "false" // Default to true
-
-	slog.Info("Log stream requested", "namespace", namespace, "pod", podName, "container", containerName, "follow", follow)
-
-	// Get pod to verify it exists first
-	pod, err := clientset.CoreV1().Pods(namespace).Get(r.Context(), podName, metav1.GetOptions{})
-	if err != nil {
-		slog.Error("Failed to get pod", "namespace", namespace, "pod", podName, "error", err)
-		http.Error(w, fmt.Sprintf("Pod not found: %v", err), http.StatusNotFound)
-		return
-	}
-
-	// Pod exists, create SSE writer
-	sse, err := NewSSEWriter(w)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Wait for pod to be ready using watch
-	if pod.Status.Phase == corev1.PodPending {
-		watcher, err := clientset.CoreV1().Pods(namespace).Watch(r.Context(), metav1.ListOptions{
-			FieldSelector: fmt.Sprintf("metadata.name=%s", podName),
-		})
-		if err != nil {
-			slog.Error("Failed to watch pod", "namespace", namespace, "pod", podName, "error", err)
-			sse.WriteJSON(LogMessage{
-				Kind: "error",
-				Text: "Failed to watch pod status",
-			})
-			return
-		}
-		defer watcher.Stop()
-
-		sse.WriteJSON(LogMessage{
-			Kind:  "status",
-			Phase: "Pending",
-		})
-		for event := range watcher.ResultChan() {
-			pod = event.Object.(*corev1.Pod)
-			if pod.Status.Phase != corev1.PodPending {
-				break
-			}
-		}
-	}
-
-	// Set up log options
-	podLogOpts := &corev1.PodLogOptions{
-		Follow:    follow,
-		Container: containerName,
-	}
-
-	// Get log stream
-	req := clientset.CoreV1().Pods(namespace).GetLogs(podName, podLogOpts)
-	stream, err := req.Stream(r.Context())
-	if err != nil {
-		slog.Error("Failed to open log stream", "namespace", namespace, "pod", podName, "container", containerName, "error", err)
-		sse.WriteJSON(LogMessage{
-			Kind: "error",
-			Text: "Failed to open log stream",
-		})
-		return
-	}
-	defer stream.Close()
-
-	// Stream logs line by line
-	scanner := bufio.NewScanner(stream)
-	for scanner.Scan() {
-		sse.WriteJSON(LogMessage{
-			Kind: "line",
-			Text: scanner.Text(),
-		})
-	}
-
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		slog.Error("Scanner error", "namespace", namespace, "pod", podName, "container", containerName, "error", err)
-		sse.WriteJSON(LogMessage{
-			Kind: "error",
-			Text: "Stream interrupted",
-		})
-	}
-
-	// Get final pod status for exit code
-	finalPod, err := clientset.CoreV1().Pods(namespace).Get(r.Context(), podName, metav1.GetOptions{})
-	if err != nil {
-		// Pod might be deleted already
-		slog.Warn("Failed to get final pod status", "namespace", namespace, "pod", podName, "error", err)
-		sse.WriteJSON(LogMessage{
-			Kind: "error",
-			Text: "Pod no longer exists",
-		})
-		return
-	}
-
-	// Find container status and send exit code
-	for _, cs := range finalPod.Status.ContainerStatuses {
-		if cs.Name == containerName {
-			if cs.State.Terminated != nil {
-				sse.WriteJSON(LogMessage{
-					Kind:     "exit",
-					ExitCode: int(cs.State.Terminated.ExitCode),
-					Reason:   cs.State.Terminated.Reason,
-				})
-			}
+	// Read events and forward to WebSocket
+	for event := range ch {
+		if err := conn.WriteJSON(event); err != nil {
 			break
 		}
 	}
-}
-
-func handleDAG(w http.ResponseWriter, r *http.Request) {
-	// For now, serve the static HTML
-	// Later this can be dynamic based on job ID
-	http.ServeFile(w, r, "run.html")
-}
-
-func handleGraph(w http.ResponseWriter, r *http.Request) {
-	// Serve the graph.json file
-	// Later this would be generated from the actual job
-	w.Header().Set("Content-Type", "application/json")
-	http.ServeFile(w, r, "graph.json")
-}
-
-func handleRun(w http.ResponseWriter, r *http.Request) {
-	// Only accept POST
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Extract namespace and pipeline from URL: /run/{namespace}/{pipeline}
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 4 {
-		http.Error(w, "Invalid path format. Expected /run/{namespace}/{pipeline}", http.StatusBadRequest)
-		return
-	}
-
-	namespace := parts[2]
-	pipelineName := parts[3]
-
-	// Read POST body
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Error reading body: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	// For now, read pipeline from ConfigMap (later: Coalesce CRD)
-	cm, err := clientset.CoreV1().ConfigMaps(namespace).Get(r.Context(), pipelineName, metav1.GetOptions{})
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Pipeline not found: %v", err), http.StatusNotFound)
-		return
-	}
-
-	source, ok := cm.Data["source"]
-	if !ok {
-		http.Error(w, "Pipeline source not found in ConfigMap", http.StatusBadRequest)
-		return
-	}
-
-	// Generate unique job name
-	jobName := fmt.Sprintf("%s-%d", pipelineName, time.Now().Unix())
-
-	// Create Job
-	ttl := int32(3600) // 1 hour TTL
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: namespace,
-			Labels: map[string]string{
-				"coalesce.io/pipeline": pipelineName,
-			},
-		},
-		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: &ttl,
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					RestartPolicy:         corev1.RestartPolicyNever,
-					ShareProcessNamespace: &[]bool{true}[0],
-					Containers: []corev1.Container{
-						{
-							Name:    "coalesce",
-							Image:   "harbor.example.org/example/coalesce:latest",
-							Command: []string{"/bin/sh", "-c"},
-							Args:    []string{fmt.Sprintf("echo '%s' | bin/coalesce -", source)},
-							Env: []corev1.EnvVar{
-								{
-									Name:  "POST_BODY",
-									Value: string(body),
-								},
-								{
-									Name:  "PIPELINE_NAME",
-									Value: pipelineName,
-								},
-								{
-									Name:  "JOB_NAME",
-									Value: jobName,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	// Create the job
-	createdJob, err := clientset.BatchV1().Jobs(namespace).Create(r.Context(), job, metav1.CreateOptions{})
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Error creating job: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Return success with job info
-	w.Header().Set("Content-Type", "application/json")
-	response := map[string]string{
-		"job":       createdJob.Name,
-		"namespace": namespace,
-		"pipeline":  pipelineName,
-		"logs_url":  fmt.Sprintf("/logs/%s/%s", namespace, createdJob.Name),
-		"dag_url":   fmt.Sprintf("/dag/%s/%s", namespace, createdJob.Name),
-	}
-	json.NewEncoder(w).Encode(response)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -359,16 +636,19 @@ func main() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 
-	// Skip migrations for now - just testing mTLS
-	slog.Info("Skipping migrations for mTLS testing")
-	// if err := runMigrations(dbURL); err != nil {
-	// 	log.Fatalf("Failed to run migrations: %v", err)
-	// }
+	// Run migrations
+	if err := runMigrations(dbURL); err != nil {
+		log.Fatalf("Failed to run migrations: %v", err)
+	}
+
+	// Initialize Stow for log storage
+	if err := initStow(); err != nil {
+		log.Fatalf("Failed to initialize storage: %v", err)
+	}
 
 	// Try in-cluster config first, fall back to kubeconfig
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		// Not in cluster, try kubeconfig
 		slog.Info("Not running in cluster, using kubeconfig", "path", *kubeconfig)
 		config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
 		if err != nil {
@@ -385,31 +665,57 @@ func main() {
 	}
 
 	// Set up routes
-	http.HandleFunc("/logs/", handleLogs)
-	http.HandleFunc("/dag/", handleDAG)
-	http.HandleFunc("/graph/", handleGraph)
-	http.HandleFunc("/run/", handleRun)
-	http.HandleFunc("/health", handleHealth)
-	http.HandleFunc("/events/", handleEvents)
+	mux := http.NewServeMux()
 
-	// Serve static files from current directory
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("."))))
+	// URL structure follows Kubernetes conventions: namespace scoping,
+	// resource-oriented paths. The (namespace, slug) pair is the identity
+	// model — it serves data science (resume with same slug) and CI/CD
+	// (unique slug per invocation) without mode switching.
+	//
+	// Executor-facing: the Zsh executor curls these to record state.
+	// UI-facing: the browser fetches these to display it.
+	mux.HandleFunc("POST /api/{namespace}/dags/{slug}", handlePostDAG)
+	mux.HandleFunc("POST /api/{namespace}/runs/{slug}", handlePostRun)
+	mux.HandleFunc("PUT /api/{namespace}/runs/{slug}", handlePutRun)
+	mux.HandleFunc("POST /api/{namespace}/jobs/{slug}/{job}", handlePostJob)
+	mux.HandleFunc("PUT /api/{namespace}/jobs/{slug}/{job}", handlePutJob)
+	mux.HandleFunc("POST /api/{namespace}/containers/{slug}/{job}/{container}", handlePostContainer)
+
+	// UI-facing endpoints
+	mux.HandleFunc("GET /api/{namespace}/runs", handleGetRuns)
+	mux.HandleFunc("GET /api/{namespace}/runs/{slug}", handleGetRun)
+	mux.HandleFunc("GET /api/{namespace}/dags/{slug}", handleGetDAG)
+	mux.HandleFunc("GET /api/{namespace}/logs/{slug}/{job}/{container}", handleGetLogs)
+
+	// WebSocket
+	mux.HandleFunc("/events/{namespace}/{slug}", handleEvents)
+
+	// Health
+	mux.HandleFunc("GET /health", handleHealth)
+
+	// Serve static files
+	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("."))))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+			http.ServeFile(w, r, "run.html")
+		} else {
+			http.NotFound(w, r)
+		}
+	})
 
 	addr := fmt.Sprintf(":%d", port)
 	slog.Info("Server starting", "addr", addr)
 
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
 
 func buildDatabaseURL() string {
-	// Check if full DATABASE_URL is provided
 	if url := os.Getenv("DATABASE_URL"); url != "" {
 		return url
 	}
 
-	// Build from individual components
 	host := os.Getenv("DB_HOST")
 	if host == "" {
 		host = "localhost"
@@ -440,35 +746,21 @@ func buildDatabaseURL() string {
 		sslmode = "disable"
 	}
 
-	// Build connection string
 	url := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
 		user, password, host, port, dbname, sslmode)
 
-	// Add SSL cert parameters if provided
 	sslcert := os.Getenv("DB_SSLCERT")
 	sslkey := os.Getenv("DB_SSLKEY")
 	sslrootcert := os.Getenv("DB_SSLROOTCERT")
 
 	if sslcert != "" {
 		url += "&sslcert=" + sslcert
-		// Check if file exists
-		if _, err := os.Stat(sslcert); err != nil {
-			slog.Warn("SSL cert file not accessible", "path", sslcert, "error", err)
-		}
 	}
 	if sslkey != "" {
 		url += "&sslkey=" + sslkey
-		// Check if file exists
-		if _, err := os.Stat(sslkey); err != nil {
-			slog.Warn("SSL key file not accessible", "path", sslkey, "error", err)
-		}
 	}
 	if sslrootcert != "" {
 		url += "&sslrootcert=" + sslrootcert
-		// Check if file exists
-		if _, err := os.Stat(sslrootcert); err != nil {
-			slog.Warn("SSL root cert file not accessible", "path", sslrootcert, "error", err)
-		}
 	}
 
 	slog.Info("Database connection configured",
@@ -476,12 +768,63 @@ func buildDatabaseURL() string {
 		"port", port,
 		"user", user,
 		"database", dbname,
-		"sslmode", sslmode,
-		"sslcert", sslcert,
-		"sslkey", sslkey,
-		"sslrootcert", sslrootcert)
+		"sslmode", sslmode)
 
 	return url
+}
+
+func initStow() error {
+	kind := os.Getenv("STOW_KIND")
+	if kind == "" {
+		kind = "local"
+	}
+
+	var config stow.ConfigMap
+	var err error
+
+	switch kind {
+	case "local":
+		path := os.Getenv("STOW_PATH")
+		if path == "" {
+			path = "/tmp/coalesce-logs"
+		}
+		if err := os.MkdirAll(path, 0755); err != nil {
+			return fmt.Errorf("failed to create log directory: %w", err)
+		}
+		config = stow.ConfigMap{
+			local.ConfigKeyPath: path,
+		}
+	case "google":
+		config = stow.ConfigMap{
+			"json": os.Getenv("STOW_GOOGLE_JSON"),
+		}
+	default:
+		return fmt.Errorf("unsupported stow kind: %s", kind)
+	}
+
+	stowLocation, err = stow.Dial(kind, config)
+	if err != nil {
+		return fmt.Errorf("failed to dial stow: %w", err)
+	}
+
+	bucket := os.Getenv("STOW_BUCKET")
+	if bucket == "" {
+		bucket = "logs"
+	}
+
+	stowContainer, err = stowLocation.Container(bucket)
+	if err != nil {
+		// Try to create it for local backend
+		if kind == "local" {
+			stowContainer, err = stowLocation.CreateContainer(bucket)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to get container: %w", err)
+		}
+	}
+
+	slog.Info("Storage initialized", "kind", kind, "bucket", bucket)
+	return nil
 }
 
 func runMigrations(dbURL string) error {
@@ -505,76 +848,12 @@ func runMigrations(dbURL string) error {
 	return nil
 }
 
-// Database helper functions
-
-func createRun(slug, pipeline string) error {
-	_, err := db.Exec(`
-		INSERT INTO runs (slug, pipeline)
-		VALUES ($1, $2)
-	`, slug, pipeline)
-	return err
-}
-
-func createJob(slug, job, k8sName string) error {
-	_, err := db.Exec(`
-		INSERT INTO jobs (slug, job, k8s_name)
-		VALUES ($1, $2, $3)
-	`, slug, job, k8sName)
-	return err
-}
-
-func updateJobStatus(slug, job, status string, exitCode *int) error {
-	if exitCode != nil {
-		_, err := db.Exec(`
-			UPDATE jobs
-			SET status = $1, exit_code = $2, completed_at = now()
-			WHERE slug = $3 AND job = $4
-		`, status, *exitCode, slug, job)
-		return err
-	}
-	_, err := db.Exec(`
-		UPDATE jobs
-		SET status = $1, completed_at = now()
-		WHERE slug = $2 AND job = $3
-	`, status, slug, job)
-	return err
-}
-
-func saveLogs(slug, job, content string) error {
-	_, err := db.Exec(`
-		INSERT INTO logs (slug, job, content)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (slug, job)
-		DO UPDATE SET content = $3
-	`, slug, job, content)
-	return err
-}
-
 func testDatabaseConnection() error {
 	var version string
-	var user string
-	var ssl string
-
 	err := db.QueryRow("SELECT version()").Scan(&version)
 	if err != nil {
 		return fmt.Errorf("failed to query version: %w", err)
 	}
-
-	err = db.QueryRow("SELECT current_user").Scan(&user)
-	if err != nil {
-		return fmt.Errorf("failed to query current user: %w", err)
-	}
-
-	err = db.QueryRow("SELECT current_setting('ssl_cert_file', true)").Scan(&ssl)
-	if err != nil {
-		// Not critical if this fails
-		ssl = "unknown"
-	}
-
-	slog.Info("Database connection successful",
-		"version", version,
-		"current_user", user,
-		"ssl_cert", ssl)
-
+	slog.Info("Database connection successful", "version", version)
 	return nil
 }
