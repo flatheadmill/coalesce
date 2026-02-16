@@ -122,7 +122,7 @@ type RunUpdateRequest struct {
 }
 
 type JobStartRequest struct {
-	StartedAt time.Time `json:"started_at,omitempty"`
+	StartedAt *time.Time `json:"started_at,omitempty"`
 }
 
 type JobUpdateRequest struct {
@@ -146,28 +146,33 @@ func handlePostDAG(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Versioned DAGs: compare to latest and only insert if different. This
-	// handles the data science case where someone adds steps mid-run to a
-	// $7,000 pipeline.
-	var latestDAG []byte
+	// Versioned DAGs: atomically compare to the latest version and only
+	// insert if different. The CTE grabs the latest, the INSERT fires only
+	// when no match exists, and RETURNING tells us whether a new version
+	// was created. One round trip, no race condition. Handles the data
+	// science case where someone adds steps mid-run to a $7,000 pipeline.
+	var createdAt time.Time
 	err := db.QueryRow(`
-		SELECT dag FROM dags
-		WHERE namespace = $1 AND slug = $2
-		ORDER BY created_at DESC LIMIT 1
-	`, namespace, slug).Scan(&latestDAG)
+		WITH latest AS (
+			SELECT dag FROM dags
+			WHERE namespace = $1 AND slug = $2
+			ORDER BY created_at DESC LIMIT 1
+		)
+		INSERT INTO dags (namespace, slug, dag)
+		SELECT $1, $2, $3::jsonb
+		WHERE NOT EXISTS (SELECT 1 FROM latest WHERE dag = $3::jsonb)
+		RETURNING created_at
+	`, namespace, slug, req.DAG).Scan(&createdAt)
 
-	if err == sql.ErrNoRows || string(latestDAG) != string(req.DAG) {
-		_, err = db.Exec(`
-			INSERT INTO dags (namespace, slug, dag)
-			VALUES ($1, $2, $3)
-		`, namespace, slug, req.DAG)
-		if err != nil {
-			slog.Error("Failed to insert DAG", "error", err)
-			http.Error(w, "Database error", http.StatusInternalServerError)
-			return
-		}
-		slog.Info("DAG inserted", "namespace", namespace, "slug", slug)
-
+	switch {
+	case err == sql.ErrNoRows:
+		// DAG matches latest version, nothing to do
+	case err != nil:
+		slog.Error("Failed to insert DAG", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	default:
+		slog.Info("DAG version created", "namespace", namespace, "slug", slug)
 		hub.Broadcast(namespace, slug, Event{Kind: "dag_updated", Data: map[string]string{
 			"namespace": namespace,
 			"slug":      slug,
@@ -232,21 +237,22 @@ func handlePutRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := db.Exec(`
+	// RETURNING gives us the actual completed_at timestamp and confirms
+	// the row exists in one step, no RowsAffected check needed.
+	var completedAt time.Time
+	err := db.QueryRow(`
 		UPDATE runs
 		SET status = $1, completed_at = now()
 		WHERE namespace = $2 AND slug = $3
-	`, req.Status, namespace, slug)
+		RETURNING completed_at
+	`, req.Status, namespace, slug).Scan(&completedAt)
 
-	if err != nil {
+	if err == sql.ErrNoRows {
+		http.Error(w, "Run not found", http.StatusNotFound)
+		return
+	} else if err != nil {
 		slog.Error("Failed to update run", "error", err)
 		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		http.Error(w, "Run not found", http.StatusNotFound)
 		return
 	}
 
@@ -269,15 +275,12 @@ func handlePostJob(w http.ResponseWriter, r *http.Request) {
 	var req JobStartRequest
 	json.NewDecoder(r.Body).Decode(&req) // Optional body
 
-	startedAt := req.StartedAt
-	if startedAt.IsZero() {
-		startedAt = time.Now()
-	}
-
+	// COALESCE lets PostgreSQL handle the default. If the executor doesn't
+	// provide started_at, now() fills in. No Go-side defaulting.
 	_, err := db.Exec(`
 		INSERT INTO jobs (namespace, slug, job, started_at, status)
-		VALUES ($1, $2, $3, $4, 'running')
-	`, namespace, slug, job, startedAt)
+		VALUES ($1, $2, $3, COALESCE($4, now()), 'running')
+	`, namespace, slug, job, req.StartedAt)
 
 	if err != nil {
 		slog.Error("Failed to create job", "error", err)
@@ -305,22 +308,14 @@ func handlePutJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var err error
-	if req.ExitCode != nil {
-		_, err = db.Exec(`
-			UPDATE jobs
-			SET status = $1, exit_code = $2, completed_at = now()
-			WHERE namespace = $3 AND slug = $4 AND job = $5
-			AND completed_at IS NULL
-		`, req.Status, *req.ExitCode, namespace, slug, job)
-	} else {
-		_, err = db.Exec(`
-			UPDATE jobs
-			SET status = $1, completed_at = now()
-			WHERE namespace = $2 AND slug = $3 AND job = $4
-			AND completed_at IS NULL
-		`, req.Status, namespace, slug, job)
-	}
+	// Go's *int passes as SQL NULL when nil, so one query handles both
+	// cases — exit_code provided or not. No branching needed.
+	_, err := db.Exec(`
+		UPDATE jobs
+		SET status = $1, exit_code = $2, completed_at = now()
+		WHERE namespace = $3 AND slug = $4 AND job = $5
+		AND completed_at IS NULL
+	`, req.Status, req.ExitCode, namespace, slug, job)
 
 	if err != nil {
 		slog.Error("Failed to update job", "error", err)
