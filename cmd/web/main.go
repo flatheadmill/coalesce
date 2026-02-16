@@ -368,18 +368,23 @@ func handlePostContainer(w http.ResponseWriter, r *http.Request) {
 	// Logs go to cloud buckets via Stow, not PostgreSQL. Stow abstracts
 	// GCS/S3/local with the same API — swap the dial string and config to
 	// switch backends. The database just stores the path.
+	//
+	// Transaction wraps the DB insert and Stow write so they're atomic from
+	// the database's perspective. If Stow fails, the DB record rolls back
+	// and we don't have a row pointing at nothing. If the DB insert fails,
+	// we never write to Stow.
 	logPath := fmt.Sprintf("%s/%s/%s/%s/%s.log",
 		namespace, slug, job, startedAt.Format("20060102-150405"), container)
 
-	_, err = stowContainer.Put(logPath, strings.NewReader(string(logContent)), int64(len(logContent)), nil)
+	tx, err := db.Begin()
 	if err != nil {
-		slog.Error("Failed to store log", "error", err, "path", logPath)
-		http.Error(w, "Storage error", http.StatusInternalServerError)
+		slog.Error("Failed to begin transaction", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
+	defer tx.Rollback()
 
-	// Record in database
-	_, err = db.Exec(`
+	_, err = tx.Exec(`
 		INSERT INTO containers (namespace, slug, job, started_at, container, log_path)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (namespace, slug, job, started_at, container) DO UPDATE SET
@@ -388,6 +393,19 @@ func handlePostContainer(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		slog.Error("Failed to record container", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = stowContainer.Put(logPath, strings.NewReader(string(logContent)), int64(len(logContent)), nil)
+	if err != nil {
+		slog.Error("Failed to store log", "error", err, "path", logPath)
+		http.Error(w, "Storage error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		slog.Error("Failed to commit transaction", "error", err)
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
@@ -458,41 +476,56 @@ func handleGetRun(w http.ResponseWriter, r *http.Request) {
 		Jobs        []Job      `json:"jobs"`
 	}
 
-	var run RunDetail
-	err := db.QueryRow(`
-		SELECT slug, pipeline, started_at, completed_at, status
-		FROM runs
-		WHERE namespace = $1 AND slug = $2
-	`, namespace, slug).Scan(&run.Slug, &run.Pipeline, &run.StartedAt, &run.CompletedAt, &run.Status)
-
-	if err == sql.ErrNoRows {
-		http.Error(w, "Run not found", http.StatusNotFound)
-		return
-	} else if err != nil {
-		slog.Error("Failed to query run", "error", err)
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-
+	// Single query with LEFT JOIN gives a consistent snapshot of the run
+	// and its jobs. Two separate queries leave a gap where a job could
+	// complete between them.
 	rows, err := db.Query(`
-		SELECT job, started_at, completed_at, status, exit_code
-		FROM jobs
-		WHERE namespace = $1 AND slug = $2
-		ORDER BY started_at
+		SELECT r.slug, r.pipeline, r.started_at, r.completed_at, r.status,
+			j.job, j.started_at, j.completed_at, j.status, j.exit_code
+		FROM runs r
+		LEFT JOIN jobs j ON j.namespace = r.namespace AND j.slug = r.slug
+		WHERE r.namespace = $1 AND r.slug = $2
+		ORDER BY j.started_at
 	`, namespace, slug)
 	if err != nil {
-		slog.Error("Failed to query jobs", "error", err)
+		slog.Error("Failed to query run", "error", err)
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
+	var run RunDetail
+	var found bool
+
 	for rows.Next() {
-		var job Job
-		if err := rows.Scan(&job.Job, &job.StartedAt, &job.CompletedAt, &job.Status, &job.ExitCode); err != nil {
+		var jobName *string
+		var jobStartedAt *time.Time
+		var jobCompletedAt *time.Time
+		var jobStatus *string
+		var jobExitCode *int
+
+		if err := rows.Scan(
+			&run.Slug, &run.Pipeline, &run.StartedAt, &run.CompletedAt, &run.Status,
+			&jobName, &jobStartedAt, &jobCompletedAt, &jobStatus, &jobExitCode,
+		); err != nil {
 			continue
 		}
-		run.Jobs = append(run.Jobs, job)
+		found = true
+
+		if jobName != nil {
+			run.Jobs = append(run.Jobs, Job{
+				Job:         *jobName,
+				StartedAt:   *jobStartedAt,
+				CompletedAt: jobCompletedAt,
+				Status:      *jobStatus,
+				ExitCode:    jobExitCode,
+			})
+		}
+	}
+
+	if !found {
+		http.Error(w, "Run not found", http.StatusNotFound)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
