@@ -9,6 +9,8 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -19,7 +21,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -32,10 +33,10 @@ import (
 	"github.com/graymeta/stow/local"
 	_ "github.com/lib/pq"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/homedir"
 )
 
 var (
@@ -631,20 +632,162 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleTailLogs starts tailing logs from a running pod identified by its
+// slug and job labels. The tailing goroutine finds the pod by label selector,
+// waits for it to leave Pending, opens a follow stream, and broadcasts each
+// line through the EventHub as a log_line event. When the stream closes it
+// fetches the exit code from container status.
+//
+// This recovers the architecture from commit 7cb44b3 ("Working tailed logs")
+// with two changes: label selectors instead of pod-by-name, and EventHub
+// broadcasting instead of SSE. The pod lifecycle handling — watch through
+// pending, bufio.Scanner for line-by-line reading, exit code from terminated
+// state — comes directly from that commit.
+func handleTailLogs(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	slug := r.PathValue("slug")
+	job := r.PathValue("job")
+	container := r.URL.Query().Get("container")
+
+	// Find the pod by the labels the executor sets when creating Jobs.
+	pods, err := clientset.CoreV1().Pods(namespace).List(r.Context(), metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("flatheadmill.github.io/slug=%s,flatheadmill.github.io/job=%s", slug, job),
+	})
+	if err != nil {
+		slog.Error("Failed to list pods", "error", err, "namespace", namespace, "slug", slug, "job", job)
+		http.Error(w, "Failed to find pod", http.StatusInternalServerError)
+		return
+	}
+
+	if len(pods.Items) == 0 {
+		http.Error(w, "No pod found for job", http.StatusNotFound)
+		return
+	}
+
+	pod := &pods.Items[0]
+	podName := pod.Name
+
+	// Default to first container if not specified.
+	if container == "" && len(pod.Spec.Containers) > 0 {
+		container = pod.Spec.Containers[0].Name
+	}
+
+	slog.Info("Starting log tail", "namespace", namespace, "slug", slug, "job", job, "pod", podName, "container", container)
+
+	// Tail in a goroutine so the HTTP request returns immediately. The
+	// goroutine feeds log lines into the EventHub where any WebSocket
+	// subscriber on this namespace/slug will receive them.
+	go tailPodLogs(namespace, slug, job, podName, container)
+
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "tailing",
+		"pod":    podName,
+	})
+}
+
+// tailPodLogs is the goroutine that actually streams logs. It watches the pod
+// through pending, opens a follow stream, reads line by line, and broadcasts
+// each line as a log_line event. When the stream closes it reports the exit
+// code.
+func tailPodLogs(namespace, slug, job, podName, container string) {
+	ctx := context.Background()
+
+	// If the pod is still pending, watch until it transitions.
+	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		slog.Error("Failed to get pod for tailing", "error", err, "pod", podName)
+		hub.Broadcast(namespace, slug, Event{Kind: "log_error", Data: map[string]string{
+			"job":   job,
+			"error": "Failed to get pod",
+		}})
+		return
+	}
+
+	if pod.Status.Phase == corev1.PodPending {
+		hub.Broadcast(namespace, slug, Event{Kind: "log_status", Data: map[string]string{
+			"job":   job,
+			"phase": "Pending",
+		}})
+
+		watcher, err := clientset.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("metadata.name=%s", podName),
+		})
+		if err != nil {
+			slog.Error("Failed to watch pod", "error", err, "pod", podName)
+			return
+		}
+
+		for event := range watcher.ResultChan() {
+			pod = event.Object.(*corev1.Pod)
+			if pod.Status.Phase != corev1.PodPending {
+				break
+			}
+		}
+		watcher.Stop()
+	}
+
+	hub.Broadcast(namespace, slug, Event{Kind: "log_status", Data: map[string]string{
+		"job":   job,
+		"phase": string(pod.Status.Phase),
+	}})
+
+	// Open the log stream with follow. bufio.Scanner reads line by line,
+	// same approach as the original 7cb44b3 implementation.
+	stream, err := clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
+		Follow:    true,
+		Container: container,
+	}).Stream(ctx)
+	if err != nil {
+		slog.Error("Failed to open log stream", "error", err, "pod", podName, "container", container)
+		hub.Broadcast(namespace, slug, Event{Kind: "log_error", Data: map[string]string{
+			"job":   job,
+			"error": "Failed to open log stream",
+		}})
+		return
+	}
+	defer stream.Close()
+
+	scanner := bufio.NewScanner(stream)
+	for scanner.Scan() {
+		hub.Broadcast(namespace, slug, Event{Kind: "log_line", Data: map[string]interface{}{
+			"job":  job,
+			"line": scanner.Text(),
+		}})
+	}
+
+	if err := scanner.Err(); err != nil && err != io.EOF {
+		slog.Error("Scanner error", "error", err, "pod", podName)
+	}
+
+	// Fetch the exit code from the terminated container state.
+	finalPod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		slog.Warn("Pod gone before exit code could be read", "pod", podName)
+		return
+	}
+
+	for _, cs := range finalPod.Status.ContainerStatuses {
+		if cs.Name == container && cs.State.Terminated != nil {
+			hub.Broadcast(namespace, slug, Event{Kind: "log_exit", Data: map[string]interface{}{
+				"job":       job,
+				"exit_code": int(cs.State.Terminated.ExitCode),
+				"reason":    cs.State.Terminated.Reason,
+			}})
+			break
+		}
+	}
+
+	slog.Info("Log tail completed", "namespace", namespace, "slug", slug, "job", job, "pod", podName)
+}
+
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
 }
 
 func main() {
-	var kubeconfig *string
 	var port int
-
-	if home := homedir.HomeDir(); home != "" {
-		kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "absolute path to the kubeconfig file")
-	} else {
-		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
-	}
 	flag.IntVar(&port, "port", 8080, "port to serve on")
 	flag.Parse()
 
@@ -674,22 +817,17 @@ func main() {
 		log.Fatalf("Failed to initialize storage: %v", err)
 	}
 
-	// Try in-cluster config first, fall back to kubeconfig
+	// The server is a pod in the cluster it serves. No kubeconfig flag, no
+	// fallback. If this isn't running in-cluster, it shouldn't be running.
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		slog.Info("Not running in cluster, using kubeconfig", "path", *kubeconfig)
-		config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
-		if err != nil {
-			log.Fatalf("Error building config: %v", err)
-		}
-	} else {
-		slog.Info("Using in-cluster configuration")
+		log.Fatalf("Not running in cluster: %v", err)
 	}
+	slog.Info("Using in-cluster configuration")
 
-	// Create clientset
 	clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Fatalf("Error creating client: %v", err)
+		log.Fatalf("Error creating Kubernetes client: %v", err)
 	}
 
 	// Set up routes
@@ -714,6 +852,9 @@ func main() {
 	mux.HandleFunc("GET /api/{namespace}/runs/{slug}", handleGetRun)
 	mux.HandleFunc("GET /api/{namespace}/dags/{slug}", handleGetDAG)
 	mux.HandleFunc("GET /api/{namespace}/logs/{slug}/{job}/{container}", handleGetLogs)
+
+	// Live log tailing — find pod by label, stream logs through EventHub
+	mux.HandleFunc("POST /api/{namespace}/tail/{slug}/{job}", handleTailLogs)
 
 	// WebSocket
 	mux.HandleFunc("/events/{namespace}/{slug}", handleEvents)

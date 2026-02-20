@@ -21,6 +21,8 @@ Stop and start with `docker stop coalesce-pg` / `docker start coalesce-pg`. Data
 
 The Go server defaults match this container: localhost:5432, user postgres, password postgres, database coalesce, SSL disabled.
 
+The Go server runs inside the OrbStack Kubernetes cluster. See HACKING for the full development setup.
+
 ---
 
 Layout
@@ -49,4 +51,4 @@ The `-s` flag sets the slug and goes before the subcommand.
 
 Current State
 
-The executor orchestrates but doesn't persist. The Go server has scaffolding — database connection, migrations, WebSocket stub — but needs endpoints wired. Priority: persistence first (SOC 2 evidence), failure propagation second, pre-flight hooks third.
+The executor orchestrates but doesn't persist. The Go server has endpoints wired for both executor (POST/PUT dags, runs, jobs, containers) and UI (GET runs, dags, logs; WebSocket events). Migrations run on startup. Stow handles log storage with local backend for development. Priority: wire the executor to curl the server, then failure propagation, then pre-flight hooks.
