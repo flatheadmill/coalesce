@@ -35,6 +35,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -339,13 +340,49 @@ func handlePutJob(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 }
 
+// storeContainerLog writes log content to Stow and records the path in
+// PostgreSQL. The transaction wraps both writes so they're atomic from the
+// database's perspective — if Stow fails, the DB record rolls back and we
+// don't have a row pointing at nothing. ON CONFLICT makes this idempotent:
+// the pod watcher and the HTTP handler can both call it safely.
+func storeContainerLog(namespace, slug, job string, startedAt time.Time, container string, logContent []byte) (string, error) {
+	logPath := fmt.Sprintf("%s/%s/%s/%s/%s.log",
+		namespace, slug, job, startedAt.Format("20060102-150405"), container)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return "", fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+		INSERT INTO containers (namespace, slug, job, started_at, container, log_path)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (namespace, slug, job, started_at, container) DO UPDATE SET
+			log_path = $6
+	`, namespace, slug, job, startedAt, container, logPath)
+	if err != nil {
+		return "", fmt.Errorf("insert container: %w", err)
+	}
+
+	_, err = stowContainer.Put(logPath, strings.NewReader(string(logContent)), int64(len(logContent)), nil)
+	if err != nil {
+		return "", fmt.Errorf("store log: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit: %w", err)
+	}
+
+	return logPath, nil
+}
+
 func handlePostContainer(w http.ResponseWriter, r *http.Request) {
 	namespace := r.PathValue("namespace")
 	slug := r.PathValue("slug")
 	job := r.PathValue("job")
 	container := r.PathValue("container")
 
-	// Get started_at from query param or use now
 	startedAtStr := r.URL.Query().Get("started_at")
 	var startedAt time.Time
 	if startedAtStr != "" {
@@ -359,61 +396,139 @@ func handlePostContainer(w http.ResponseWriter, r *http.Request) {
 		startedAt = time.Now()
 	}
 
-	// Read log content from body
 	logContent, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read body", http.StatusBadRequest)
 		return
 	}
 
-	// Logs go to cloud buckets via Stow, not PostgreSQL. Stow abstracts
-	// GCS/S3/local with the same API — swap the dial string and config to
-	// switch backends. The database just stores the path.
-	//
-	// Transaction wraps the DB insert and Stow write so they're atomic from
-	// the database's perspective. If Stow fails, the DB record rolls back
-	// and we don't have a row pointing at nothing. If the DB insert fails,
-	// we never write to Stow.
-	logPath := fmt.Sprintf("%s/%s/%s/%s/%s.log",
-		namespace, slug, job, startedAt.Format("20060102-150405"), container)
-
-	tx, err := db.Begin()
+	logPath, err := storeContainerLog(namespace, slug, job, startedAt, container, logContent)
 	if err != nil {
-		slog.Error("Failed to begin transaction", "error", err)
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-	defer tx.Rollback()
-
-	_, err = tx.Exec(`
-		INSERT INTO containers (namespace, slug, job, started_at, container, log_path)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (namespace, slug, job, started_at, container) DO UPDATE SET
-			log_path = $6
-	`, namespace, slug, job, startedAt, container, logPath)
-
-	if err != nil {
-		slog.Error("Failed to record container", "error", err)
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
-
-	_, err = stowContainer.Put(logPath, strings.NewReader(string(logContent)), int64(len(logContent)), nil)
-	if err != nil {
-		slog.Error("Failed to store log", "error", err, "path", logPath)
+		slog.Error("Failed to store container log", "error", err)
 		http.Error(w, "Storage error", http.StatusInternalServerError)
-		return
-	}
-
-	if err := tx.Commit(); err != nil {
-		slog.Error("Failed to commit transaction", "error", err)
-		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
 
 	slog.Info("Container log stored", "namespace", namespace, "slug", slug, "job", job, "container", container)
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{"status": "created", "log_path": logPath})
+}
+
+// harvestPodLogs fetches logs for every container in a terminated pod and
+// stores them. The job's started_at comes from PostgreSQL because the
+// containers table has a FK to jobs on (namespace, slug, job, started_at).
+// If the job record doesn't exist yet (executor hasn't curled it), we skip
+// — the watcher will see the pod again on the next list cycle.
+func harvestPodLogs(ctx context.Context, pod *corev1.Pod) {
+	namespace := pod.Namespace
+	slug := pod.Labels["flatheadmill.github.io/slug"]
+	job := pod.Labels["flatheadmill.github.io/job"]
+
+	if slug == "" || job == "" {
+		return
+	}
+
+	var startedAt time.Time
+	err := db.QueryRow(`
+		SELECT started_at FROM jobs
+		WHERE namespace = $1 AND slug = $2 AND job = $3
+		ORDER BY started_at DESC LIMIT 1
+	`, namespace, slug, job).Scan(&startedAt)
+	if err != nil {
+		slog.Warn("Job record not found for log harvest, skipping",
+			"namespace", namespace, "slug", slug, "job", job)
+		return
+	}
+
+	for _, c := range pod.Spec.Containers {
+		logStream, err := clientset.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+			Container: c.Name,
+		}).Stream(ctx)
+		if err != nil {
+			slog.Warn("Failed to fetch container logs",
+				"pod", pod.Name, "container", c.Name, "error", err)
+			continue
+		}
+
+		logContent, err := io.ReadAll(logStream)
+		logStream.Close()
+		if err != nil {
+			slog.Warn("Failed to read container logs",
+				"pod", pod.Name, "container", c.Name, "error", err)
+			continue
+		}
+
+		logPath, err := storeContainerLog(namespace, slug, job, startedAt, c.Name, logContent)
+		if err != nil {
+			slog.Error("Failed to store harvested log",
+				"pod", pod.Name, "container", c.Name, "error", err)
+			continue
+		}
+
+		slog.Info("Harvested container log",
+			"pod", pod.Name, "container", c.Name, "path", logPath)
+	}
+}
+
+// watchPodCompletions watches for pods with our label that reach a terminal
+// state and harvests their logs. The watch can disconnect — the outer loop
+// re-lists and re-watches. On each cycle it first sweeps terminated pods
+// from the list response (catching anything that completed while the watch
+// was down or before the server started), then watches for new completions.
+//
+// The SIGTERM contract means containers exit cleanly and their logs are
+// available. The ttlSecondsAfterFinished gives us five minutes to harvest.
+// If the node disappears first, that's the accepted 5% — we don't contort
+// the architecture to cover it.
+func watchPodCompletions(ctx context.Context, namespace string) {
+	for {
+		// List first to catch pods that terminated while we weren't watching.
+		pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: "flatheadmill.github.io/slug",
+		})
+		if err != nil {
+			slog.Error("Failed to list pods for log harvest", "error", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+				harvestPodLogs(ctx, pod)
+			}
+		}
+
+		// Watch from the list's resource version so we don't miss anything
+		// between the list and the watch.
+		watcher, err := clientset.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{
+			LabelSelector:   "flatheadmill.github.io/slug",
+			ResourceVersion: pods.ResourceVersion,
+		})
+		if err != nil {
+			slog.Error("Failed to start pod watch for log harvest", "error", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		for event := range watcher.ResultChan() {
+			// DELETE events carry the pod's last state, which is terminal.
+			// The pod is already gone — nothing to harvest.
+			if event.Type == watch.Deleted {
+				continue
+			}
+			pod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				continue
+			}
+			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+				harvestPodLogs(ctx, pod)
+			}
+		}
+
+		// Watch disconnected. Loop back to list + watch.
+		slog.Info("Pod watch disconnected, restarting")
+	}
 }
 
 // UI-facing handlers
@@ -829,6 +944,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error creating Kubernetes client: %v", err)
 	}
+
+	// Start the pod log harvester. It watches for terminated pods and
+	// collects their logs into Stow before the node drains and the logs
+	// vanish. The namespace is scoped to match the RBAC Role.
+	watchNamespace := os.Getenv("WATCH_NAMESPACE")
+	if watchNamespace == "" {
+		watchNamespace = "default"
+	}
+	go watchPodCompletions(context.Background(), watchNamespace)
+	slog.Info("Pod log harvester started", "namespace", watchNamespace)
 
 	// Set up routes
 	mux := http.NewServeMux()

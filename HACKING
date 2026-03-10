@@ -98,6 +98,30 @@ port-forward.
 
 ---
 
+OrbStack Networking
+
+OrbStack's networking is what makes the development loop practical. From the
+Mac you can directly reach pod IPs, ClusterIP services, and cluster DNS names.
+No kubectl port-forward, no tunnels, no special configuration. The Mac's DNS
+resolver knows about the cluster.
+
+This means the browser works too. Open the UI at:
+
+    http://coalesce-web.default.svc.cluster.local/?slug=test-wire
+
+The same URL works from curl, from the browser, from any process on the Mac.
+The server serves run.html at / so the API calls from JavaScript use relative
+URLs that route to the same server.
+
+Containers on the Mac reach pods via host.orb.internal. Pods reach the Mac
+(for PostgreSQL) via host.orb.internal. The executor runs on the Mac and
+creates Jobs via kubectl. Everything talks to everything without port mapping.
+
+For containers outside Kubernetes, OrbStack assigns domain names at
+container-name.orb.local with automatic HTTPS via the macOS keychain.
+
+---
+
 Development Loop
 
 After editing Go code, the cycle is:

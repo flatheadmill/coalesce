@@ -2,16 +2,31 @@
 
 zshctl[man_title]='Coalesce Manuals'
 
+# CRC32 to lowercase hex for deterministic job name suffixes. The same slug
+# and path always produce the same hash, so re-running a pipeline with the
+# same slug recreates identical job names — the resume case.
 function _coalesce_cksum {
     typeset -i16 hex_var=$(printf '%s' ${1:-} | cksum | cut -d' ' -f1)
     print ${hex_var[4,-1]:l}
 }
 
+# The _coalesce associative array is the entire DAG state. Each node is a set
+# of compound keys like coalesce.fanout.baz:kind, coalesce.fanout.baz:queue,
+# coalesce.fanout.baz:over. The root node "coalesce" has parallel 1 because
+# top-level steps run serially — the pipeline is a sequence, parallelism
+# happens inside tranches.
 function _coalesce_init {
     typeset -gA _coalesce=( coalesce:queue '' coalesce:over 0 coalesce:parallel 1 )
     typeset -ga _coalesce_children=()
 }
 
+# The step function is the pipeline DSL. It runs at source time to build the
+# DAG before any jobs execute. Two kinds of nodes: a step with -p creates a
+# tranche (a sync point that groups children with a parallelism limit), a step
+# without -p creates a pod (an actual Kubernetes Job). The -u flag places a
+# node under a parent using slash notation that maps to dot-separated keys
+# internally. -p0 means unlimited parallelism (2^63-1 so the comparison logic
+# stays uniform), -p1 means serial, -pN means at most N concurrent children.
 function step {
     eval "$(args n,name u,under p,parallel f,func -- "$@")"
     typeset node pod split=() under=() join=( coalesce ) queue=()
@@ -46,11 +61,12 @@ function step {
 }
 
 function :args {
-    eval "$(args -UC -bx h,help -s s,slug -- "$@")"
+    eval "$(args -UC -bx h,help -s s,slug -s N,namespace -- "$@")"
 }
 
 function :execute {
     [[ -v o_slug ]] || abend 'slug is required'
+    [[ -v o_namespace ]] || o_namespace=default
     delegate "$@"
 }
 

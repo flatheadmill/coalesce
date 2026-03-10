@@ -1,5 +1,14 @@
 #!/usr/bin/env zsh
 
+# Builds Job YAML from the step's stored arguments using gojq and jo. The
+# `:::` separator splits arguments into multiple containers — everything
+# between separators becomes one container definition. This is how a step
+# declares a multi-container pod (main + sidecar).
+#
+# The job name is slug + CRC32 hash + leaf name, making it deterministic.
+# Re-running a pipeline with the same slug produces the same job names, which
+# is how ON CONFLICT resume works in the cubbyhole.
+#
 # TODO Make `:::` configurable, so if you need `:::` as an argument use `@@@`
 # instead, for example.
 function _coalesce_job_yaml {
@@ -47,13 +56,14 @@ function _coalesce_job_yaml {
             --argjson args "$(jo \
                 name=$name \
                 labels=$labels \
-                namespace=default \
+                namespace=$o_namespace \
                 containers="$(jo  -a -- "${(@)containers}" < /dev/null)" \
          )" \
         '
             .metadata.name = $args.name |
             .metadata.namespace = $args.namespace |
             .metadata.labels = $args.labels |
+            .spec.template.metadata.labels = $args.labels |
             .spec.template.spec.containers = $args.containers
         '  <({
             heredoc <<'            EOF'
@@ -67,6 +77,8 @@ function _coalesce_job_yaml {
                   backoffLimit: 0
                   ttlSecondsAfterFinished: 300
                   template:
+                    metadata:
+                      labels: {}
                     spec:
                       restartPolicy: Never
                       containers: []
@@ -75,6 +87,10 @@ function _coalesce_job_yaml {
     )
 }
 
+# Completion propagates up the tree. When a child completes, its parent's
+# :over count increments. If :over equals the queue length, the parent itself
+# is complete and propagation continues upward. The root node "coalesce" stops
+# the recursion — the pipeline is done when the root's children are all over.
 function _coalesce_propagate_over {
     typeset child=${1:-}
     shift
@@ -89,6 +105,18 @@ function _coalesce_propagate_over {
     _coalesce_propagate_over $parent
 }
 
+# The scheduling heart. Called after each completion to find newly runnable
+# work. Two anonymous functions divide the logic:
+#
+# First function: re-descend into tranches that are already started but not
+# yet complete. A tranche with 4 children and 2 over has work to check
+# inside. This catches the case where a completion inside a nested tranche
+# frees up the next sibling.
+#
+# Second function: start new work at this level, respecting the parallel
+# limit. The outstanding count (started minus over) is compared against the
+# parallel cap. Tranches are descended into immediately. Pods are appended
+# to the runnable array for _coalesce_run_start_jobs to launch.
 function _coalesce_descend_jobs {
     typeset node=${1:-} queue=()
     shift
@@ -135,6 +163,8 @@ function _coalesce_descend_jobs {
     }
 }
 
+# Launch runnable pods. The :ran check enables resume — if we loaded state
+# from PostgreSQL at startup, already-completed jobs are skipped.
 function _coalesce_run_start_jobs {
     typeset job
     typeset -A k8s
@@ -144,9 +174,23 @@ function _coalesce_run_start_jobs {
         # TODO Check with app if there is a metadata.json.
         kubectl apply -f - <<< $k8s[yaml]
         _coalesce[${job}:ran]=1
+        curl -s -X POST "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${job}" \
+            -H 'Content-Type: application/json' -d '{}' > /dev/null
     done
 }
 
+# The event loop. After the initial descend-and-launch, it opens a kubectl
+# watch as a coproc filtered by the slug label. Every job created with this
+# slug appears in the watch stream automatically — the loop feeds itself.
+#
+# The outer while loop exists because kubectl watches can disconnect. If the
+# watch drops, it restarts. The inner loop reads JSON events, parses them
+# through jq into a tape (a flat array of labels and conditions), and acts
+# on completions: mark done, propagate up, descend for new work, launch.
+#
+# The coproc pattern: open as coproc, capture PID, steal the fd, then
+# immediately replace the coproc slot with a no-op so the fd stays open
+# without holding the coproc. This lets us track the PID for SIGTERM cleanup.
 function _coalesce_run {
     typeset runnable=() tape=() outcomes=()
     typeset line key value completed outcome_count outcome
@@ -161,6 +205,10 @@ function _coalesce_run {
         _coalesce_children+=( $child )
         exec {fd}<&p;
         coproc :
+        # Each JSON event is flattened by jq into a tape: label count, then
+        # key-value pairs, then condition count, then condition types. This
+        # avoids calling jq multiple times per event — one parse extracts
+        # everything, Zsh unpacks it positionally.
         while read -r line; do
             tape=( "${(@QA)${(z)$(
                 jq -r '
@@ -189,11 +237,23 @@ function _coalesce_run {
             for outcome in "${(@)outcomes}"; do
                 case $outcome in
                 (Pending|SuccessCriteriaMet) ;;
-                (Failed) ;;
+                (Failed)
+                    # Record the failure in the cubbyhole. Failure propagation
+                    # (whether to stop siblings or the run) is a policy decision
+                    # for a later phase.
+                    typeset failed_job=$labels[flatheadmill.github.io/job]
+                    print failed $failed_job
+                    curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${failed_job}" \
+                        -H 'Content-Type: application/json' \
+                        -d '{"status": "failed"}' > /dev/null
+                    ;;
                 (Complete)
                     completed=$labels[flatheadmill.github.io/job]
                     print complete $completed
                     _coalesce[${completed}:over]=1
+                    curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${completed}" \
+                        -H 'Content-Type: application/json' \
+                        -d '{"status": "completed"}' > /dev/null
                     ;;
                 esac
             done
@@ -204,6 +264,10 @@ function _coalesce_run {
                 if (( ${#runnable} )); then
                     _coalesce_run_start_jobs
                 else
+                    # No new runnable pods, but are we actually done? Check
+                    # every node in the DAG for an :over entry. If any node
+                    # lacks one, there's still outstanding work — it just
+                    # hasn't completed yet.
                     over=1
                     for key in "${(@k)_coalesce}"; do
                         if (( ! ${+_coalesce[${key%%:*}:over]} )); then
@@ -237,7 +301,24 @@ function :execute:run {
             kill $child
         done
     }
+    typeset -g _coalesce_url=${COALESCE_URL:-http://coalesce-web.default.svc.cluster.local}
     _coalesce_init
     source $1
+    # POST the DAG and start a run in the cubbyhole before launching jobs.
+    # Invoke the dag subcommand rather than calling functions directly —
+    # subcommands stay in their own files so they don't all get copied
+    # into branch commands.
+    typeset dag_json=$($zshctl[argzero] -s $o_slug dag $1)
+    curl -s -X POST "${_coalesce_url}/api/${o_namespace}/dags/${o_slug}" \
+        -H 'Content-Type: application/json' \
+        -d "{\"dag\": $dag_json}" > /dev/null
+    curl -s -X POST "${_coalesce_url}/api/${o_namespace}/runs/${o_slug}" \
+        -H 'Content-Type: application/json' \
+        -d "$(jo pipeline=$1)" > /dev/null
     _coalesce_run
+    # The run is over — mark it in the cubbyhole. This is the SOC 2 money
+    # shot: the scan ran and completed.
+    curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/runs/${o_slug}" \
+        -H 'Content-Type: application/json' \
+        -d '{"status": "completed"}' > /dev/null
 }
