@@ -177,7 +177,7 @@ function _coalesce_run_start_jobs {
         (( ${+_coalesce[${job}:ran]} )) && continue
         _coalesce_job_yaml $job
         # TODO Check with app if there is a metadata.json.
-        kubectl apply -f - <<< $k8s[yaml]
+        kubectl apply --namespace $o_namespace -f - <<< $k8s[yaml]
         _coalesce[${job}:ran]=1
         curl -s -X POST "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${job}" \
             -H 'Content-Type: application/json' -d '{}' > /dev/null
@@ -204,7 +204,7 @@ function _coalesce_run {
     _coalesce_run_start_jobs
     integer fd child entries over
     while (( ! _coalesce[over] )); do
-        coproc kubectl get jobs -l flatheadmill.github.io/slug=$o_slug \
+        coproc kubectl get jobs --namespace $o_namespace -l flatheadmill.github.io/slug=$o_slug \
             --watch --output-watch-events --output json
         child=${!}
         _coalesce_children+=( $child )
