@@ -51,12 +51,16 @@ function _coalesce_job_yaml {
     typeset labels=$(
         jo -- flatheadmill.github.io/job=$job flatheadmill.github.io/slug=$o_slug
     )
+    # imagePullSecrets is optional: emitted only when COALESCE_IMAGE_PULL_SECRET
+    # names the secret, so public-image and OrbStack runs stay untouched while a
+    # private-registry cluster (millwright on Harbor) can pull.
     k8s[yaml]=$(
         gojq --yaml-input --yaml-output \
             --argjson args "$(jo \
                 name=$name \
                 labels=$labels \
                 namespace=$o_namespace \
+                pullSecret=${COALESCE_IMAGE_PULL_SECRET:-} \
                 containers="$(jo  -a -- "${(@)containers}" < /dev/null)" \
          )" \
         '
@@ -64,7 +68,8 @@ function _coalesce_job_yaml {
             .metadata.namespace = $args.namespace |
             .metadata.labels = $args.labels |
             .spec.template.metadata.labels = $args.labels |
-            .spec.template.spec.containers = $args.containers
+            .spec.template.spec.containers = $args.containers |
+            (if ($args.pullSecret // "") != "" then .spec.template.spec.imagePullSecrets = [{ name: $args.pullSecret }] else . end)
         '  <({
             heredoc <<'            EOF'
                 apiVersion: batch/v1
