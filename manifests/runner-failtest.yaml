@@ -1,0 +1,73 @@
+# The red-is-real proof. Codex verified failure propagation against fake
+# kubectl processes; this puts it in front of a genuinely failed Kubernetes
+# Job, which is the case the webhook depends on.
+#
+# Nothing in the pipeline is modified. The run is simply pointed at a
+# repository that does not exist: millwright cannot mirror it, so the build
+# context is never created, and buildctl fails as the step's last command.
+# That makes the container exit non-zero, which fails the child Job, which is
+# exactly the event the executor must propagate.
+#
+# What we are watching for: the runner records the run failed rather than
+# completed, and exits 1 rather than blocking forever on a step that will
+# never finish.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: coalesce-runner-failtest
+  namespace: coalesce
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: coalesce-runner-failtest
+        flatheadmill.github.io/slug: failtest-pr-1-deadbeefcafe
+    spec:
+      serviceAccountName: coalesce-runner
+      restartPolicy: Never
+      imagePullSecrets:
+      - name: registry
+      containers:
+      - name: runner
+        image: harbor.example.org/example/coalesce-runner:latest
+        imagePullPolicy: Always
+        args:
+        - run
+        - -N
+        - coalesce
+        - -s
+        - failtest-pr-1-deadbeefcafe
+        - /run/coalesce/pipelines/build.coalesce.zsh
+        env:
+        - name: COALESCE_URL
+          value: http://coalesce.coalesce.svc.cluster.local
+        - name: GITHUB_REPOSITORY
+          value: example/example-nosuchrepository
+        - name: GITHUB_PR_NUMBER
+          value: "1"
+        - name: GITHUB_BASE_REF
+          value: main
+        - name: GITHUB_BASE_SHA
+          value: 02dfcd9504e3d3a3d492a357cb24fbd62f40b85f
+        - name: GITHUB_HEAD_REF
+          value: topic/main/nonexistent
+        - name: GITHUB_HEAD_SHA
+          value: c60e3a8448afe3b0f827f0383bdfbf144e307775
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          runAsNonRoot: true
+          runAsUser: 1000
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: pipeline
+          mountPath: /run/coalesce/pipelines
+          readOnly: true
+      volumes:
+      - name: pipeline
+        configMap:
+          name: coalesce-pipeline-secrets
