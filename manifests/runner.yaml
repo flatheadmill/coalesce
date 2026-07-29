@@ -1,0 +1,224 @@
+# This is the in-cluster runner proof, deliberately separate from the long-lived
+# Coalesce component. The pipeline is data: the runner mounts and sources this
+# ConfigMap, while the image supplies only the executor and its toolchain.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coalesce-pipeline-secrets
+  namespace: coalesce
+data:
+  build.coalesce.zsh: |
+    function zsh_step {
+        eval "$(args f,func -- "$@")"
+        [[ -v o_func ]] || abend "--func is required"
+        typeset src=${functions[$o_func]}
+        trim src
+        o_yaml=$(
+            gojq --yaml-input --yaml-output \
+                --argjson args "$(jo \
+                    args="$(jo  -a -- "sh" "-c" "$src" < /dev/null)" \
+             )" \
+            '
+                .spec.template.spec.containers[0].args = $args.args
+            '  <({
+                heredoc <<'            EOF'
+                    apiVersion: batch/v1
+                    kind: Job
+                    metadata:
+                      name: null
+                      namespace: null
+                      labels: {}
+                    spec:
+                      backoffLimit: 0
+                      ttlSecondsAfterFinished: 300
+                      template:
+                        metadata:
+                          labels: {}
+                        spec:
+                          imagePullSecrets:
+                          - name: registry
+                          restartPolicy: Never
+                          nodeSelector:
+                            node-role.kubernetes.io/coalesce: ""
+                          tolerations:
+                          - key: node-role.kubernetes.io/coalesce
+                            operator: Exists
+                            effect: NoSchedule
+                          containers:
+                          - name: build
+                            image: harbor.example.org/example/millwright
+                            imagePullPolicy: Always
+                            args: []
+                            securityContext:
+                              allowPrivilegeEscalation: true
+                              seccompProfile:
+                                type: Unconfined
+                              appArmorProfile:
+                                type: Unconfined
+                            volumeMounts:
+                            - name: millwright
+                              mountPath: /run/example/millwright
+                            - name: secret
+                              readOnly: true
+                              mountPath: "/run/example/secret"
+                            - name: docker
+                              mountPath: /run/example/docker
+                          volumes:
+                          - name: millwright
+                            configMap:
+                              name: millwright
+                          - name: secret
+                            secret:
+                              secretName: secret
+                          - name: docker
+                            secret:
+                              secretName: registry
+                              items:
+                              - key: .dockerconfigjson
+                                path: config.json
+                EOF
+            })
+        )
+        print -r -- "$o_yaml"
+    }
+
+    # The build step, parameterized by the pull request the run was fired for.
+    # The __TOKENS__ are substituted from the executor's environment when this
+    # file is sourced, so the SHA the container builds is the PR's real head, not
+    # a literal frozen in the file. Values expand at source time in the executor
+    # shell (option A, no framework change); the body then rides into the pod
+    # unchanged. The env is set by whatever fires the run -- a hand-set demo today,
+    # the webhook receiver later.
+    function say_hello {
+        eval `ssh-agent`
+        export GITHUB_BASE_REF=__BASE_REF__
+        export GITHUB_BASE_SHA=__BASE_SHA__
+        export GITHUB_HEAD_REF=__HEAD_REF__
+        export GITHUB_HEAD_SHA=__HEAD_SHA__
+        tar -C /home/linuxbrew/.linuxbrew -zxf /run/example/millwright/millwright.tar.gz
+        millwright gitconfig
+        millwright sshconfig
+        millwright mirror --repository __REPO__
+        millwright merge --repository __REPO__
+        export BUILDKITD_FLAGS="--oci-worker-no-process-sandbox --root /home/linuxbrew/.local/share/buildkit"
+        export ROOTLESSKIT="rootlesskit --copy-up=/run"
+        export DOCKER_CONFIG=/run/example/docker
+        export XDG_RUNTIME_DIR=/home/linuxbrew/.run
+        mkdir -p $XDG_RUNTIME_DIR /home/linuxbrew/.local/share/buildkit && chmod 700 $XDG_RUNTIME_DIR
+        buildctl-daemonless.sh build --frontend dockerfile.v0 --local context=/git/__NAME__/main --local dockerfile=/git/__NAME__/main --output type=image,name=__IMAGE__,push=true
+    }
+
+    function {
+        : ${GITHUB_REPOSITORY:?set GITHUB_REPOSITORY} ${GITHUB_PR_NUMBER:?set GITHUB_PR_NUMBER}
+        : ${GITHUB_BASE_REF:?} ${GITHUB_BASE_SHA:?} ${GITHUB_HEAD_REF:?} ${GITHUB_HEAD_SHA:?}
+        # millwright strips owner/prefix- from the repo name: example-secrets -> secrets.
+        typeset name=${GITHUB_REPOSITORY#*/*-}
+        typeset image=harbor.example.org/example/${name}:pr-${GITHUB_PR_NUMBER}
+        typeset body=${functions[say_hello]}
+        body=${body//__BASE_REF__/$GITHUB_BASE_REF}
+        body=${body//__BASE_SHA__/$GITHUB_BASE_SHA}
+        body=${body//__HEAD_REF__/$GITHUB_HEAD_REF}
+        body=${body//__HEAD_SHA__/$GITHUB_HEAD_SHA}
+        body=${body//__REPO__/$GITHUB_REPOSITORY}
+        body=${body//__NAME__/$name}
+        body=${body//__IMAGE__/$image}
+        functions[say_hello]=$body
+        step -n build -- zsh_step -f say_hello
+    }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coalesce-runner
+  namespace: coalesce
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coalesce-runner
+  namespace: coalesce
+rules:
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create", "get", "list", "patch", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coalesce-runner
+  namespace: coalesce
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coalesce-runner
+subjects:
+- kind: ServiceAccount
+  name: coalesce-runner
+  namespace: coalesce
+---
+# example-secrets#8 is the already-proven build, now launched by an in-cluster
+# executor. This Job is a disposable proof fixture; the receiver will create the
+# same pod shape with event-derived values and a deterministic run slug.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: coalesce-runner-secrets-pr-8-c60e3a8448af
+  namespace: coalesce
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: coalesce-runner
+        flatheadmill.github.io/slug: secrets-pr-8-c60e3a8448af
+    spec:
+      serviceAccountName: coalesce-runner
+      restartPolicy: Never
+      imagePullSecrets:
+      - name: registry
+      containers:
+      - name: runner
+        image: harbor.example.org/example/coalesce-runner:latest
+        imagePullPolicy: Always
+        args:
+        - run
+        - -N
+        - coalesce
+        - -s
+        - secrets-pr-8-c60e3a8448af
+        - /run/coalesce/pipelines/build.coalesce.zsh
+        env:
+        - name: COALESCE_URL
+          value: http://coalesce.coalesce.svc.cluster.local
+        - name: GITHUB_REPOSITORY
+          value: example/example-secrets
+        - name: GITHUB_PR_NUMBER
+          value: "8"
+        - name: GITHUB_BASE_REF
+          value: main
+        - name: GITHUB_BASE_SHA
+          value: 02dfcd9504e3d3a3d492a357cb24fbd62f40b85f
+        - name: GITHUB_HEAD_REF
+          value: topic/main/typography
+        - name: GITHUB_HEAD_SHA
+          value: c60e3a8448afe3b0f827f0383bdfbf144e307775
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          runAsNonRoot: true
+          # Numeric, because the kubelet cannot prove a USER name is non-root.
+          # Millwright's linuxbrew is uid 1000; without this the container never
+          # starts, failing CreateContainerConfigError before any pull is used.
+          runAsUser: 1000
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: pipeline
+          mountPath: /run/coalesce/pipelines
+          readOnly: true
+      volumes:
+      - name: pipeline
+        configMap:
+          name: coalesce-pipeline-secrets

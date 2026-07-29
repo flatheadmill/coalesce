@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+
+# The runner is Coalesce's Zsh executor inside Kubernetes, not another
+# workstation image. Millwright already carries the house shell runtime and
+# every external command the executor and build pipeline need; this layer adds
+# Coalesce's command tree and tini. tini forwards TERM to the whole foreground
+# process group, so Zsh is released from a blocking curl or kubectl child and
+# can run its early TERM trap; it also reaps any orphaned coprocess.
+
+ARG MILLWRIGHT_IMAGE=harbor.example.org/example/millwright:latest
+FROM ${MILLWRIGHT_IMAGE}
+
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini \
+ && rm -rf /var/lib/apt/lists/*
+COPY --chmod=0755 bin/coalesce /usr/bin/coalesce
+COPY share/coalesce /usr/share/coalesce
+
+USER linuxbrew
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/bin/coalesce"]
