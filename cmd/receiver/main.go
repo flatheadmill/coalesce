@@ -79,14 +79,9 @@ func configFromEnvironment() (receiverConfig, string, error) {
 		return receiverConfig{}, "", fmt.Errorf("WEBHOOK_SECRET is required")
 	}
 
-	allowed := make(map[string]struct{})
-	for _, repository := range strings.Split(os.Getenv("ALLOWED_REPOSITORIES"), ",") {
-		if repository = strings.TrimSpace(repository); repository != "" {
-			allowed[repository] = struct{}{}
-		}
-	}
-	if len(allowed) == 0 {
-		return receiverConfig{}, "", fmt.Errorf("ALLOWED_REPOSITORIES is required")
+	repositoryPattern := strings.TrimSpace(os.Getenv("REPOSITORY_PATTERN"))
+	if repositoryPattern == "" {
+		return receiverConfig{}, "", fmt.Errorf("REPOSITORY_PATTERN is required")
 	}
 
 	maxBodyBytes := defaultMaxBodyBytes
@@ -100,7 +95,7 @@ func configFromEnvironment() (receiverConfig, string, error) {
 
 	config := receiverConfig{
 		Secret:            []byte(secret),
-		Allowed:           allowed,
+		RepositoryPattern: repositoryPattern,
 		Namespace:         environment("JOB_NAMESPACE", defaultNamespace),
 		RunnerImage:       environment("RUNNER_IMAGE", defaultRunnerImage),
 		PipelineConfigMap: environment("PIPELINE_CONFIG_MAP", defaultPipelineMap),

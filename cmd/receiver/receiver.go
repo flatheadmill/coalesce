@@ -38,7 +38,7 @@ var (
 
 type receiverConfig struct {
 	Secret            []byte
-	Allowed           map[string]struct{}
+	RepositoryPattern string
 	Namespace         string
 	RunnerImage       string
 	PipelineConfigMap string
@@ -49,8 +49,9 @@ type receiverConfig struct {
 }
 
 type receiver struct {
-	jobs   batchclient.JobInterface
-	config receiverConfig
+	jobs              batchclient.JobInterface
+	config            receiverConfig
+	repositoryPattern *regexp.Regexp
 }
 
 type pullRequestEvent struct {
@@ -76,8 +77,8 @@ func newReceiver(jobs batchclient.JobInterface, config receiverConfig) (*receive
 	switch {
 	case len(config.Secret) == 0:
 		return nil, errors.New("webhook secret is required")
-	case len(config.Allowed) == 0:
-		return nil, errors.New("at least one allowed repository is required")
+	case config.RepositoryPattern == "":
+		return nil, errors.New("repository pattern is required")
 	case config.Namespace == "":
 		return nil, errors.New("job namespace is required")
 	case config.RunnerImage == "":
@@ -94,17 +95,20 @@ func newReceiver(jobs batchclient.JobInterface, config receiverConfig) (*receive
 		return nil, errors.New("API timeout must be positive")
 	}
 
-	allowed := make(map[string]struct{}, len(config.Allowed))
-	for repository := range config.Allowed {
-		repository = strings.ToLower(strings.TrimSpace(repository))
-		if err := validateRepository(repository); err != nil {
-			return nil, fmt.Errorf("allowed repository %q: %w", repository, err)
-		}
-		allowed[repository] = struct{}{}
+	if !strings.HasPrefix(config.RepositoryPattern, "^") ||
+		!strings.HasSuffix(config.RepositoryPattern, "$") {
+		return nil, errors.New("repository pattern must be anchored with ^ and $")
 	}
-	config.Allowed = allowed
+	repositoryPattern, err := regexp.Compile(config.RepositoryPattern)
+	if err != nil {
+		return nil, fmt.Errorf("compile repository pattern: %w", err)
+	}
 
-	return &receiver{jobs: jobs, config: config}, nil
+	return &receiver{
+		jobs:              jobs,
+		config:            config,
+		repositoryPattern: repositoryPattern,
+	}, nil
 }
 
 func (receiver *receiver) ServeHTTP(w http.ResponseWriter, request *http.Request) {
@@ -160,7 +164,8 @@ func (receiver *receiver) ServeHTTP(w http.ResponseWriter, request *http.Request
 	}
 
 	repository := strings.ToLower(payload.Repository.FullName)
-	if _, ok := receiver.config.Allowed[repository]; !ok {
+	match := receiver.repositoryPattern.FindStringIndex(repository)
+	if match == nil || match[0] != 0 || match[1] != len(repository) {
 		http.Error(w, "Repository not allowed", http.StatusForbidden)
 		return
 	}

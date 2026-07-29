@@ -138,6 +138,42 @@ func TestReceiverIgnoresNonBuildPullRequestActions(t *testing.T) {
 	}
 }
 
+func TestReceiverMatchesTheWholeRepositoryName(t *testing.T) {
+	handler, client := testReceiver(t, 1<<20)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, signedRequest(t, "pull_request",
+		validPayload("Example_Inc/Secrets.Site-evil"), testSecret))
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("non-exact repository created %d Jobs", len(jobs.Items))
+	}
+}
+
+func TestReceiverRejectsUnanchoredRepositoryPattern(t *testing.T) {
+	_, err := newReceiver(fake.NewSimpleClientset().BatchV1().Jobs("coalesce"), receiverConfig{
+		Secret:            []byte(testSecret),
+		RepositoryPattern: `example_inc/secrets[.]site`,
+		Namespace:         "coalesce",
+		RunnerImage:       "example.invalid/coalesce-runner:test",
+		PipelineConfigMap: "coalesce-pipeline-secrets",
+		PipelineFile:      "build.coalesce.zsh",
+		CoalesceURL:       "http://coalesce.coalesce.svc.cluster.local",
+		MaxBodyBytes:      1 << 20,
+		APITimeout:        time.Second,
+	})
+	if err == nil || !strings.Contains(err.Error(), "must be anchored") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -291,10 +327,8 @@ func testReceiver(t *testing.T, maxBodyBytes int64) (*receiver, *fake.Clientset)
 	t.Helper()
 	client := fake.NewSimpleClientset()
 	handler, err := newReceiver(client.BatchV1().Jobs("coalesce"), receiverConfig{
-		Secret: []byte(testSecret),
-		Allowed: map[string]struct{}{
-			"example_inc/secrets.site": {},
-		},
+		Secret:            []byte(testSecret),
+		RepositoryPattern: `^example_inc/secrets[.]site$`,
 		Namespace:         "coalesce",
 		RunnerImage:       "example.invalid/coalesce-runner:test",
 		PipelineConfigMap: "coalesce-pipeline-secrets",
