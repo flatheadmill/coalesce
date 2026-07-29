@@ -1,22 +1,9 @@
 #!/usr/bin/env zsh
 
-# Builds Job YAML from the step's stored arguments using gojq and jo. The
-# `:::` separator splits arguments into multiple containers — everything
-# between separators becomes one container definition. This is how a step
-# declares a multi-container pod (main + sidecar).
-#
-# The job name is slug + CRC32 hash + leaf name, making it deterministic.
-# Re-running a pipeline with the same slug produces the same job names, which
-# is how ON CONFLICT resume works in the cubbyhole.
-#
-# TODO Make `:::` configurable, so if you need `:::` as an argument use `@@@`
-# instead, for example.
-function _coalesce_job_yaml {
-    typeset job=${1:-}
-    shift
+function pod {
     typeset container containers=()
     typeset args=() arg image
-    for arg in "${(@QA)${(z)_coalesce[${job}:args]}}" ":::"; do
+    for arg in "$@" ":::"; do
         if [[ $arg = ":::" ]]; then
             eval "$(args -@ -- "${(@)args}")"
             image=${1:-}
@@ -47,29 +34,13 @@ function _coalesce_job_yaml {
             args+=( $arg )
         fi
     done
-    typeset name=${o_slug}-$(_coalesce_cksum $o_slug.$job)-${job##*.}
-    typeset labels=$(
-        jo -- flatheadmill.github.io/job=$job flatheadmill.github.io/slug=$o_slug
-    )
-    # imagePullSecrets is optional: emitted only when COALESCE_IMAGE_PULL_SECRET
-    # names the secret, so public-image and OrbStack runs stay untouched while a
-    # private-registry cluster (millwright on Harbor) can pull.
-    k8s[yaml]=$(
+    o_yaml=$(
         gojq --yaml-input --yaml-output \
             --argjson args "$(jo \
-                name=$name \
-                labels=$labels \
-                namespace=$o_namespace \
-                pullSecret=${COALESCE_IMAGE_PULL_SECRET:-} \
                 containers="$(jo  -a -- "${(@)containers}" < /dev/null)" \
          )" \
         '
-            .metadata.name = $args.name |
-            .metadata.namespace = $args.namespace |
-            .metadata.labels = $args.labels |
-            .spec.template.metadata.labels = $args.labels |
-            .spec.template.spec.containers = $args.containers |
-            (if ($args.pullSecret // "") != "" then .spec.template.spec.imagePullSecrets = [{ name: $args.pullSecret }] else . end)
+            .spec.template.spec.containers = $args.containers
         '  <({
             heredoc <<'            EOF'
                 apiVersion: batch/v1
@@ -92,22 +63,123 @@ function _coalesce_job_yaml {
     )
 }
 
-# Completion propagates up the tree. When a child completes, its parent's
-# :over count increments. If :over equals the queue length, the parent itself
-# is complete and propagation continues upward. The root node "coalesce" stops
-# the recursion — the pipeline is done when the root's children are all over.
-function _coalesce_propagate_over {
-    typeset child=${1:-}
+# Builds Job YAML from the step's stored arguments using gojq and jo. The
+# `:::` separator splits arguments into multiple containers — everything
+# between separators becomes one container definition. This is how a step
+# declares a multi-container pod (main + sidecar).
+#
+# The job name is slug + CRC32 hash + leaf name, making it deterministic.
+# Re-running a pipeline with the same slug produces the same job names, which
+# is how ON CONFLICT resume works in the cubbyhole.
+#
+# TODO Make `:::` configurable, so if you need `:::` as an argument use `@@@`
+# instead, for example.
+function _coalesce_job_yaml {
+    typeset job=${1:-}
     shift
-    typeset parent=${child%.*}
-    print over $child $parent
-    ((_coalesce[${parent}:over]++))
+    typeset o_yaml
+    "${(@QA)${(z)_coalesce[${job}:args]}}"
+    typeset name=${o_slug}-$(_coalesce_cksum $o_slug.$job)-${job##*.}
+    typeset labels=$(
+        jo -- flatheadmill.github.io/job=$job flatheadmill.github.io/slug=$o_slug
+    )
+    # imagePullSecrets is optional: emitted only when COALESCE_IMAGE_PULL_SECRET
+    # names the secret, so public-image and OrbStack runs stay untouched while a
+    # private-registry cluster (millwright on Harbor) can pull.
+    k8s[yaml]=$(
+        gojq --yaml-input --yaml-output \
+            --argjson args "$(jo \
+                name=$name \
+                labels=$labels \
+                namespace=$o_namespace \
+         )" \
+        '
+            .metadata.name = $args.name |
+            .metadata.namespace = $args.namespace |
+            .metadata.labels = $args.labels |
+            .spec.template.metadata.labels = $args.labels
+        '  <(printf %s "$o_yaml")
+    )
+}
+
+# A skipped node never launched, so it has no job record to update. Mark its
+# whole subtree terminal in memory; this keeps the counter-scheduler honest
+# without turning "skipped" into stored evidence that would poison a resume.
+function _coalesce_skip_tree {
+    typeset node=${1:-} child
+    typeset queue=()
+    _coalesce[${node}:status]=skipped
+    case $_coalesce[${node}:kind] in
+    (tranche)
+        queue=( "${(@AQ)${(z)_coalesce[${node}:queue]}}" )
+        _coalesce[${node}:started]=${#queue}
+        _coalesce[${node}:over]=${#queue}
+        for child in "${(@)queue}"; do
+            _coalesce_skip_tree ${node}.${child}
+        done
+        ;;
+    (pod)
+        _coalesce[${node}:over]=1
+        ;;
+    esac
+    print skipped $node
+}
+
+# A serial tranche declares that later siblings depend on the failed child.
+# They never launch. A parallel tranche never calls this function: its queued
+# siblings are independent and continue to drain under the ordinary throttle.
+function _coalesce_skip_serial_tail {
+    typeset parent=${1:-} child
     typeset queue=( "${(@AQ)${(z)_coalesce[${parent}:queue]}}" )
-    if [[ $_coalesce[${parent}:over] -lt ${#queue} || $parent = coalesce ]]; then
+    integer offset=$(( _coalesce[${parent}:started] + 1 ))
+    while (( offset <= ${#queue} )); do
+        child=${parent}.${queue[$offset]}
+        ((offset++))
+        ((_coalesce[${parent}:started]++))
+        ((_coalesce[${parent}:over]++))
+        _coalesce_skip_tree $child
+    done
+}
+
+# Terminal state propagates along the same structural edges as completion. A
+# parent becomes failed if any child failed, but does not become terminal until
+# every independent child has drained (or every dependent tail node was
+# skipped). The root's status is the run-level rollup.
+function _coalesce_propagate_terminal {
+    typeset child=${1:-}
+    typeset terminal_status=${2:-}
+    typeset parent=${child%.*}
+    typeset parent_status=completed
+    typeset queue=( "${(@AQ)${(z)_coalesce[${parent}:queue]}}" )
+
+    ((_coalesce[${parent}:over]++))
+    if [[ $terminal_status = failed ]]; then
+        _coalesce[${parent}:failed]=1
+        if (( _coalesce[${parent}:parallel] == 1 )); then
+            _coalesce_skip_serial_tail $parent
+        fi
+    fi
+    if (( _coalesce[${parent}:over] < ${#queue} )); then
         return
     fi
-    print ">>>" $parent $_coalesce[${parent}:over] ${#queue}
-    _coalesce_propagate_over $parent
+
+    (( ${+_coalesce[${parent}:failed]} )) && parent_status=failed
+    _coalesce[${parent}:status]=$parent_status
+    print terminal $parent $parent_status
+    if [[ $parent = coalesce ]]; then
+        _coalesce[over]=1
+        return
+    fi
+    _coalesce_propagate_terminal $parent $parent_status
+}
+
+function _coalesce_mark_terminal {
+    typeset node=${1:-}
+    typeset terminal_status=${2:-}
+    (( ${+_coalesce[${node}:status]} )) && return 1
+    _coalesce[${node}:status]=$terminal_status
+    _coalesce[${node}:over]=1
+    _coalesce_propagate_terminal $node $terminal_status
 }
 
 # The scheduling heart. Called after each completion to find newly runnable
@@ -198,7 +270,7 @@ function _coalesce_run_start_jobs {
 # without holding the coproc. This lets us track the PID for SIGTERM cleanup.
 function _coalesce_run {
     typeset runnable=() tape=() outcomes=()
-    typeset line key value completed outcome_count outcome
+    typeset line key value terminal outcome_count outcome
     typeset -A labels
     _coalesce_descend_jobs coalesce
     _coalesce_run_start_jobs
@@ -238,92 +310,83 @@ function _coalesce_run {
             shift
             outcomes=( "${(@)@[1,$outcome_count]}" )
             shift $outcome_count
-            completed=
+            terminal=
             for outcome in "${(@)outcomes}"; do
                 case $outcome in
                 (Pending|SuccessCriteriaMet) ;;
                 (Failed)
-                    # Record the failure in the cubbyhole. Failure propagation
-                    # (whether to stop siblings or the run) is a policy decision
-                    # for a later phase.
                     typeset failed_job=$labels[flatheadmill.github.io/job]
-                    print failed $failed_job
-                    curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${failed_job}" \
-                        -H 'Content-Type: application/json' \
-                        -d '{"status": "failed"}' > /dev/null
+                    if _coalesce_mark_terminal $failed_job failed; then
+                        terminal=$failed_job
+                        print failed $failed_job
+                        curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${failed_job}" \
+                            -H 'Content-Type: application/json' \
+                            -d '{"status": "failed"}' > /dev/null
+                    fi
                     ;;
                 (Complete)
-                    completed=$labels[flatheadmill.github.io/job]
-                    print complete $completed
-                    _coalesce[${completed}:over]=1
-                    curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${completed}" \
-                        -H 'Content-Type: application/json' \
-                        -d '{"status": "completed"}' > /dev/null
+                    typeset completed_job=$labels[flatheadmill.github.io/job]
+                    if _coalesce_mark_terminal $completed_job completed; then
+                        terminal=$completed_job
+                        print complete $completed_job
+                        curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${completed_job}" \
+                            -H 'Content-Type: application/json' \
+                            -d '{"status": "completed"}' > /dev/null
+                    fi
                     ;;
                 esac
             done
-            if [[ ! -z $completed ]]; then
-                _coalesce_propagate_over $completed
+            if [[ -n $terminal ]]; then
+                if (( _coalesce[over] )); then
+                    _coalesce_stop_children
+                    break
+                fi
                 runnable=()
                 _coalesce_descend_jobs coalesce
                 if (( ${#runnable} )); then
                     _coalesce_run_start_jobs
-                else
-                    # No new runnable pods, but are we actually done? Check
-                    # every node in the DAG for an :over entry. If any node
-                    # lacks one, there's still outstanding work — it just
-                    # hasn't completed yet.
-                    over=1
-                    for key in "${(@k)_coalesce}"; do
-                        if (( ! ${+_coalesce[${key%%:*}:over]} )); then
-                            over=0
-                            break
-                        fi
-                    done
-                    if (( over )); then
-                        kill $child
-                        wait $child
-                        _coalesce[over]=1
-                        break
-                    fi
                 fi
             fi
         done <&${fd}
-        _coalesce_children=()
+        _coalesce_stop_children
     done
     print exiting
 }
 
 function :args:run {
-    eval "$(args -bx h,help -- "$@")"
+    eval "$(args s,slug N,namespace -bx h,help -- "$@")"
+}
+
+function _coalesce_finish_run {
+    (( _coalesce_run_started )) || return
+    curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/runs/${o_slug}" \
+        -H 'Content-Type: application/json' \
+        -d "$(jo status=$_coalesce_run_status)" > /dev/null || return
+    _coalesce_run_started=0
 }
 
 function :execute:run {
-    function TRAPTERM {
-        typeset child
-        _coalesce[over]=1
-        for child in "${(@)_coalesce_children}"; do
-            kill $child
-        done
-    }
-    typeset -g _coalesce_url=${COALESCE_URL:-http://coalesce-web.default.svc.cluster.local}
+    [[ -v o_slug ]] || abend 'slug is required'
+    [[ -v o_namespace ]] || o_namespace=default
+    typeset -g _coalesce_url=${COALESCE_URL:-http://coalesce.default.svc.cluster.local}
+    _coalesce_run_started=0
+    _coalesce_run_status=running
     _coalesce_init
     source $1
     # POST the DAG and start a run in the cubbyhole before launching jobs.
     # Invoke the dag subcommand rather than calling functions directly —
     # subcommands stay in their own files so they don't all get copied
     # into branch commands.
-    typeset dag_json=$($zshctl[argzero] -s $o_slug dag $1)
+    typeset dag_json=$($zshctl[argzero] dag -s $o_slug $1)
     curl -s -X POST "${_coalesce_url}/api/${o_namespace}/dags/${o_slug}" \
         -H 'Content-Type: application/json' \
-        -d "{\"dag\": $dag_json}" > /dev/null
+        -d "{\"dag\": $dag_json}" > /dev/null || abend 'unable to reach storage'
     curl -s -X POST "${_coalesce_url}/api/${o_namespace}/runs/${o_slug}" \
         -H 'Content-Type: application/json' \
-        -d "$(jo pipeline=$1)" > /dev/null
+        -d "$(jo pipeline=$1)" > /dev/null || abend 'unable to reach storage'
+    _coalesce_run_started=1
     _coalesce_run
-    # The run is over — mark it in the cubbyhole. This is the SOC 2 money
-    # shot: the scan ran and completed.
-    curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/runs/${o_slug}" \
-        -H 'Content-Type: application/json' \
-        -d '{"status": "completed"}' > /dev/null
+    _coalesce_run_status=${_coalesce[coalesce:status]:-failed}
+    _coalesce_finish_run || return 1
+    [[ $_coalesce_run_status = completed ]]
 }

@@ -2,6 +2,35 @@
 
 zshctl[man_title]='Coalesce Manuals'
 
+typeset -ga _coalesce_children=()
+typeset -g _coalesce_run_started=0
+typeset -g _coalesce_run_status=
+
+# tini forwards the runner's TERM to Coalesce and its foreground children.
+# Install the handler before argument parsing or storage calls so Coalesce can
+# always record the interruption, including during the narrow startup window
+# before the run command has initialized.
+function _coalesce_stop_children {
+    typeset child
+    for child in "${(@)_coalesce_children}"; do
+        kill $child 2> /dev/null
+    done
+    for child in "${(@)_coalesce_children}"; do
+        wait $child 2> /dev/null
+    done
+    _coalesce_children=()
+}
+
+function TRAPTERM {
+    _coalesce_run_status=interrupted
+    _coalesce_stop_children
+    if (( _coalesce_run_started )) &&
+            (( ${+functions[_coalesce_finish_run]} )); then
+        _coalesce_finish_run
+    fi
+    exit 143
+}
+
 # CRC32 to lowercase hex for deterministic job name suffixes. The same slug
 # and path always produce the same hash, so re-running a pipeline with the
 # same slug recreates identical job names — the resume case.
@@ -17,7 +46,7 @@ function _coalesce_cksum {
 # happens inside tranches.
 function _coalesce_init {
     typeset -gA _coalesce=( coalesce:queue '' coalesce:over 0 coalesce:parallel 1 )
-    typeset -ga _coalesce_children=()
+    _coalesce_children=()
 }
 
 # The step function is the pipeline DSL. It runs at source time to build the
@@ -61,12 +90,10 @@ function step {
 }
 
 function :args {
-    eval "$(args -UC -bx h,help -s s,slug -s N,namespace -- "$@")"
+    eval "$(args -UC -bx h,help -- "$@")"
 }
 
 function :execute {
-    [[ -v o_slug ]] || abend 'slug is required'
-    [[ -v o_namespace ]] || o_namespace=default
     delegate "$@"
 }
 

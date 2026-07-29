@@ -234,8 +234,9 @@ func handlePutRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Status != "completed" && req.Status != "failed" && req.Status != "cancelled" {
-		http.Error(w, "Status must be completed, failed, or cancelled", http.StatusBadRequest)
+	if req.Status != "completed" && req.Status != "failed" &&
+		req.Status != "cancelled" && req.Status != "interrupted" {
+		http.Error(w, "Status must be completed, failed, cancelled, or interrupted", http.StatusBadRequest)
 		return
 	}
 

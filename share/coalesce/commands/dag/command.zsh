@@ -44,10 +44,12 @@ function _coalesce_dag_json {
 }
 
 function :args:dag {
-    eval "$(args -bx h,help -- "$@")"
+    eval "$(args s,slug N,namespace -bx h,help -- "$@")"
 }
 
 function :execute:dag {
+    [[ -v o_slug ]] || abend 'slug is required'
+    [[ -v o_namespace ]] || o_namespace=default
     _coalesce_init
     source $1
     _coalesce_dag_json
