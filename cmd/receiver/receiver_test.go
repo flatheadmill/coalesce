@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -280,14 +283,17 @@ func TestPipelineCacheRejectsIncompleteContract(t *testing.T) {
 
 func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 	tests := []struct {
-		name       string
-		event      string
-		body       []byte
-		secret     string
-		method     string
-		want       int
-		maxBytes   int64
-		noDelivery bool
+		name        string
+		event       string
+		body        []byte
+		secret      string
+		method      string
+		want        int
+		maxBytes    int64
+		noDelivery  bool
+		contentType string
+		check       string
+		logContains []string
 	}{
 		{
 			name:     "invalid signature",
@@ -297,6 +303,7 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 			method:   http.MethodPost,
 			want:     http.StatusUnauthorized,
 			maxBytes: 1 << 20,
+			check:    "signature",
 		},
 		{
 			name:     "oversized body",
@@ -306,15 +313,25 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 			method:   http.MethodPost,
 			want:     http.StatusRequestEntityTooLarge,
 			maxBytes: 32,
+			check:    "body_size",
+			logContains: []string{
+				`"maximum_bytes":32`,
+				`"content_length":`,
+			},
 		},
 		{
-			name:     "invalid JSON",
-			event:    "pull_request",
-			body:     []byte(`{`),
-			secret:   testSecret,
-			method:   http.MethodPost,
-			want:     http.StatusBadRequest,
-			maxBytes: 1 << 20,
+			name:        "form encoded body is invalid JSON",
+			event:       "pull_request",
+			body:        []byte(`payload=%7B%22action%22%3A%22synchronize%22%7D`),
+			secret:      testSecret,
+			method:      http.MethodPost,
+			want:        http.StatusBadRequest,
+			maxBytes:    1 << 20,
+			contentType: "application/x-www-form-urlencoded",
+			check:       "json",
+			logContains: []string{
+				`"content_type":"application/x-www-form-urlencoded"`,
+			},
 		},
 		{
 			name:       "missing delivery ID",
@@ -325,6 +342,7 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 			want:       http.StatusBadRequest,
 			maxBytes:   1 << 20,
 			noDelivery: true,
+			check:      "delivery",
 		},
 		{
 			name:     "wrong organization",
@@ -334,6 +352,10 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 			method:   http.MethodPost,
 			want:     http.StatusForbidden,
 			maxBytes: 1 << 20,
+			check:    "organization",
+			logContains: []string{
+				`"repository":"someone/else"`,
+			},
 		},
 		{
 			name:     "wrong method",
@@ -343,6 +365,10 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 			method:   http.MethodGet,
 			want:     http.StatusMethodNotAllowed,
 			maxBytes: 1 << 20,
+			check:    "method",
+			logContains: []string{
+				`"method":"GET"`,
+			},
 		},
 		{
 			name:     "invalid repository",
@@ -352,14 +378,48 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 			method:   http.MethodPost,
 			want:     http.StatusUnprocessableEntity,
 			maxBytes: 1 << 20,
+			check:    "repository",
+			logContains: []string{
+				`"repository":"not-an-owner-name"`,
+			},
+		},
+		{
+			name:     "invalid event",
+			event:    "pull-request",
+			body:     validPayload("Example_Inc/Secrets.Site", "synchronize"),
+			secret:   testSecret,
+			method:   http.MethodPost,
+			want:     http.StatusBadRequest,
+			maxBytes: 1 << 20,
+			check:    "event",
+			logContains: []string{
+				`"event_value":"pull-request"`,
+			},
+		},
+		{
+			name:     "invalid action",
+			event:    "pull_request",
+			body:     validPayload("Example_Inc/Secrets.Site", "not.valid"),
+			secret:   testSecret,
+			method:   http.MethodPost,
+			want:     http.StatusUnprocessableEntity,
+			maxBytes: 1 << 20,
+			check:    "action",
+			logContains: []string{
+				`"action":"not.valid"`,
+			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			handler, client, _ := testReceiver(t, test.maxBytes)
+			logs := captureLogs(t)
 			request := signedRequest(t, test.event, test.body, test.secret)
 			request.Method = test.method
+			if test.contentType != "" {
+				request.Header.Set("Content-Type", test.contentType)
+			}
 			if test.noDelivery {
 				request.Header.Del("X-GitHub-Delivery")
 			}
@@ -381,7 +441,58 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 			if len(jobs.Items) != 0 {
 				t.Fatalf("rejected request created %d Jobs", len(jobs.Items))
 			}
+			log := logs.String()
+			if !strings.Contains(log, `"level":"INFO"`) ||
+				!strings.Contains(log, `"msg":"GitHub webhook rejected"`) ||
+				!strings.Contains(log, `"check":"`+test.check+`"`) {
+				t.Fatalf("rejection log = %s", log)
+			}
+			for _, value := range test.logContains {
+				if !strings.Contains(log, value) {
+					t.Errorf("rejection log does not contain %q: %s", value, log)
+				}
+			}
+			if strings.Contains(log, testSecret) ||
+				strings.Contains(log, request.Header.Get("X-Hub-Signature-256")) {
+				t.Errorf("rejection log contains a secret: %s", log)
+			}
 		})
+	}
+}
+
+func TestReceiverLogsBodyReadFailure(t *testing.T) {
+	handler, client, _ := testReceiver(t, 1<<20)
+	logs := captureLogs(t)
+	request := httptest.NewRequest(http.MethodPost, webhookPath, failingReader{})
+	request.Header.Set("X-GitHub-Delivery", "delivery-read")
+	request.Header.Set("X-GitHub-Event", "pull_request")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	jobs, err := client.BatchV1().Jobs("coalesce").List(
+		t.Context(),
+		metav1.ListOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("rejected request created %d Jobs", len(jobs.Items))
+	}
+	log := logs.String()
+	for _, value := range []string{
+		`"level":"INFO"`,
+		`"check":"body_read"`,
+		`"delivery":"delivery-read"`,
+		`"error":"read failed"`,
+	} {
+		if !strings.Contains(log, value) {
+			t.Errorf("rejection log does not contain %q: %s", value, log)
+		}
 	}
 }
 
@@ -466,6 +577,23 @@ func environmentMap(environment []corev1.EnvVar) map[string]string {
 		values[variable.Name] = variable.Value
 	}
 	return values
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buffer bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buffer, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(previous)
+	})
+	return &buffer
 }
 
 func signedRequest(t *testing.T, event string, body []byte, secret string) *http.Request {

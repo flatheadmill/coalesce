@@ -270,7 +270,12 @@ func newReceiver(
 func (receiver *receiver) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		rejectWebhook(w, request,
+			http.StatusMethodNotAllowed,
+			"Method not allowed",
+			"method",
+			"method", request.Method,
+		)
 		return
 	}
 
@@ -279,10 +284,22 @@ func (receiver *receiver) ServeHTTP(w http.ResponseWriter, request *http.Request
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			http.Error(w, "Payload too large", http.StatusRequestEntityTooLarge)
+			rejectWebhook(w, request,
+				http.StatusRequestEntityTooLarge,
+				"Payload too large",
+				"body_size",
+				"content_length", request.ContentLength,
+				"bytes_read", len(body),
+				"maximum_bytes", receiver.config.MaxBodyBytes,
+			)
 			return
 		}
-		http.Error(w, "Unable to read payload", http.StatusBadRequest)
+		rejectWebhook(w, request,
+			http.StatusBadRequest,
+			"Unable to read payload",
+			"body_read",
+			"error", err,
+		)
 		return
 	}
 
@@ -290,14 +307,22 @@ func (receiver *receiver) ServeHTTP(w http.ResponseWriter, request *http.Request
 	// lookup, so the signature survives the Cloudflare-to-Traefik porch.
 	signature := request.Header.Get("X-Hub-Signature-256")
 	if !validSignature(receiver.config.Secret, body, signature) {
-		http.Error(w, "Invalid signature", http.StatusUnauthorized)
+		rejectWebhook(w, request,
+			http.StatusUnauthorized,
+			"Invalid signature",
+			"signature",
+		)
 		return
 	}
 
 	event := strings.ToLower(strings.TrimSpace(request.Header.Get("X-GitHub-Event")))
 	delivery := request.Header.Get("X-GitHub-Delivery")
 	if delivery == "" {
-		http.Error(w, "GitHub delivery ID is required", http.StatusBadRequest)
+		rejectWebhook(w, request,
+			http.StatusBadRequest,
+			"GitHub delivery ID is required",
+			"delivery",
+		)
 		return
 	}
 	if event == "ping" {
@@ -305,22 +330,44 @@ func (receiver *receiver) ServeHTTP(w http.ResponseWriter, request *http.Request
 		return
 	}
 	if !validEventPart(event) {
-		http.Error(w, "GitHub event is invalid", http.StatusBadRequest)
+		rejectWebhook(w, request,
+			http.StatusBadRequest,
+			"GitHub event is invalid",
+			"event",
+			"event_value", event,
+		)
 		return
 	}
 
 	var envelope webhookEnvelope
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		rejectWebhook(w, request,
+			http.StatusBadRequest,
+			"Invalid JSON",
+			"json",
+			"content_type", request.Header.Get("Content-Type"),
+			"error", err,
+		)
 		return
 	}
 	owner, _, err := splitRepository(envelope.Repository.FullName)
 	if err != nil {
-		http.Error(w, "Repository full_name is invalid", http.StatusUnprocessableEntity)
+		rejectWebhook(w, request,
+			http.StatusUnprocessableEntity,
+			"Repository full_name is invalid",
+			"repository",
+			"repository", envelope.Repository.FullName,
+		)
 		return
 	}
 	if !strings.EqualFold(owner, receiver.config.Organization) {
-		http.Error(w, "Repository organization not allowed", http.StatusForbidden)
+		rejectWebhook(w, request,
+			http.StatusForbidden,
+			"Repository organization not allowed",
+			"organization",
+			"repository", envelope.Repository.FullName,
+			"organization", owner,
+		)
 		return
 	}
 
@@ -329,7 +376,13 @@ func (receiver *receiver) ServeHTTP(w http.ResponseWriter, request *http.Request
 	if envelope.Action != "" {
 		action := strings.ToLower(envelope.Action)
 		if !validEventPart(action) {
-			http.Error(w, "GitHub action is invalid", http.StatusUnprocessableEntity)
+			rejectWebhook(w, request,
+				http.StatusUnprocessableEntity,
+				"GitHub action is invalid",
+				"action",
+				"repository", repository,
+				"action", action,
+			)
 			return
 		}
 		qualifiedEvent += "." + action
@@ -384,6 +437,28 @@ func (receiver *receiver) ServeHTTP(w http.ResponseWriter, request *http.Request
 		"status": "created",
 		"jobs":   created,
 	})
+}
+
+func rejectWebhook(
+	w http.ResponseWriter,
+	request *http.Request,
+	status int,
+	response, check string,
+	details ...any,
+) {
+	attributes := []any{
+		"check", check,
+		"status", status,
+	}
+	if delivery := request.Header.Get("X-GitHub-Delivery"); delivery != "" {
+		attributes = append(attributes, "delivery", delivery)
+	}
+	if event := request.Header.Get("X-GitHub-Event"); event != "" {
+		attributes = append(attributes, "event", event)
+	}
+	attributes = append(attributes, details...)
+	slog.Info("GitHub webhook rejected", attributes...)
+	http.Error(w, response, status)
 }
 
 func validSignature(secret, body []byte, signature string) bool {
