@@ -1,13 +1,8 @@
 // The receiver is Coalesce's public doorman, not another orchestrator. It
-// verifies the GitHub delivery, translates one permitted pull request into
-// one deterministic runner Job, and waits for Kubernetes to accept that Job
-// before answering. Everything after creation belongs to the runner.
-//
-// GitHub's delivery UI is part of the diagnostic surface. A 5xx means the
-// Cloudflare/Traefik porch answered but the receiver failed. A timeout points
-// at the porch itself: Cloudflare takes longer to conclude a 521 or 522 than
-// GitHub waits. If the API create crosses GitHub's deadline, the Job may still
-// exist; redelivery is safe because AlreadyExists is success.
+// verifies GitHub deliveries and dispatches them through the pipeline
+// ConfigMaps currently present in its namespace. The ConfigMaps are the
+// allowlist and the routing table; their ./run programs own everything after
+// Kubernetes accepts the Job.
 package main
 
 import (
@@ -19,18 +14,23 @@ import (
 	"strings"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	kcache "k8s.io/client-go/tools/cache"
 )
 
 const (
-	defaultAddress      = ":8080"
-	defaultNamespace    = "coalesce"
-	defaultRunnerImage  = "harbor.example.org/example/coalesce-runner:latest"
-	defaultPipelineMap  = "coalesce-pipeline-secrets"
-	defaultPipelineFile = "build.coalesce.zsh"
-	defaultCoalesceURL  = "http://coalesce.coalesce.svc.cluster.local"
-	defaultMaxBodyBytes = int64(1 << 20)
+	defaultAddress     = ":8080"
+	defaultNamespace   = "coalesce"
+	defaultCoalesceURL = "http://coalesce.coalesce.svc.cluster.local"
+	// The signed body becomes a pod annotation so an oversized webhook fails
+	// while the receiver is creating the Job, before GitHub sees green. The API
+	// server allows roughly 256 KiB across an object's annotations; 192 KiB
+	// leaves 64 KiB for keys and other annotations while remaining generous for
+	// pull-request payloads.
+	defaultMaxBodyBytes = int64(192 << 10)
 	defaultAPITimeout   = 8 * time.Second
 )
 
@@ -49,7 +49,31 @@ func main() {
 		log.Fatalf("create Kubernetes client: %v", err)
 	}
 
-	handler, err := newReceiver(clientset.BatchV1().Jobs(config.Namespace), config)
+	pipelines := newPipelineCache(config.Organization)
+	factory := informers.NewSharedInformerFactoryWithOptions(
+		clientset,
+		0,
+		informers.WithNamespace(config.Namespace),
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = pipelineLabel
+		}),
+	)
+	informer := factory.Core().V1().ConfigMaps().Informer()
+	if _, err := informer.AddEventHandler(pipelines.handlers()); err != nil {
+		log.Fatalf("watch pipeline ConfigMaps: %v", err)
+	}
+	stop := make(chan struct{})
+	defer close(stop)
+	factory.Start(stop)
+	if !kcache.WaitForCacheSync(stop, informer.HasSynced) {
+		log.Fatal("pipeline ConfigMap cache did not synchronize")
+	}
+
+	handler, err := newReceiver(
+		clientset.BatchV1().Jobs(config.Namespace),
+		pipelines,
+		config,
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -78,10 +102,9 @@ func configFromEnvironment() (receiverConfig, string, error) {
 	if secret == "" {
 		return receiverConfig{}, "", fmt.Errorf("WEBHOOK_SECRET is required")
 	}
-
-	repositoryPattern := strings.TrimSpace(os.Getenv("REPOSITORY_PATTERN"))
-	if repositoryPattern == "" {
-		return receiverConfig{}, "", fmt.Errorf("REPOSITORY_PATTERN is required")
+	organization := strings.TrimSpace(os.Getenv("GITHUB_ORGANIZATION"))
+	if organization == "" {
+		return receiverConfig{}, "", fmt.Errorf("GITHUB_ORGANIZATION is required")
 	}
 
 	maxBodyBytes := defaultMaxBodyBytes
@@ -94,15 +117,12 @@ func configFromEnvironment() (receiverConfig, string, error) {
 	}
 
 	config := receiverConfig{
-		Secret:            []byte(secret),
-		RepositoryPattern: repositoryPattern,
-		Namespace:         environment("JOB_NAMESPACE", defaultNamespace),
-		RunnerImage:       environment("RUNNER_IMAGE", defaultRunnerImage),
-		PipelineConfigMap: environment("PIPELINE_CONFIG_MAP", defaultPipelineMap),
-		PipelineFile:      environment("PIPELINE_FILE", defaultPipelineFile),
-		CoalesceURL:       environment("COALESCE_URL", defaultCoalesceURL),
-		MaxBodyBytes:      maxBodyBytes,
-		APITimeout:        defaultAPITimeout,
+		Secret:       []byte(secret),
+		Organization: organization,
+		Namespace:    environment("JOB_NAMESPACE", defaultNamespace),
+		CoalesceURL:  environment("COALESCE_URL", defaultCoalesceURL),
+		MaxBodyBytes: maxBodyBytes,
+		APITimeout:   defaultAPITimeout,
 	}
 	return config, environment("LISTEN_ADDRESS", defaultAddress), nil
 }

@@ -4,7 +4,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/fake"
@@ -19,9 +19,12 @@ import (
 
 const testSecret = "correct horse battery staple"
 
-func TestReceiverCreatesRunnerJob(t *testing.T) {
-	handler, client := testReceiver(t, 1<<20)
-	request := signedRequest(t, "pull_request", validPayload("Example_Inc/Secrets.Site"), testSecret)
+var testNow = time.Unix(1_754_000_000, 0)
+
+func TestReceiverDispatchesRawPayload(t *testing.T) {
+	handler, client, _ := testReceiver(t, 1<<20)
+	body := validPayload("Example_Inc/Secrets.Site", "synchronize")
+	request := signedRequest(t, "pull_request", body, testSecret)
 	request.Header.Set("X-GitHub-Delivery", "delivery-123")
 	response := httptest.NewRecorder()
 
@@ -39,68 +42,148 @@ func TestReceiverCreatesRunnerJob(t *testing.T) {
 	}
 
 	job := jobs.Items[0]
+	if job.Name != "secrets-site-pull-request-synchronize-1754000000" {
+		t.Fatalf("Job name = %q", job.Name)
+	}
 	if problems := validation.IsDNS1123Label(job.Name); len(problems) != 0 {
 		t.Fatalf("Job name %q is invalid: %v", job.Name, problems)
 	}
-	if len(job.Name) > 63 {
-		t.Fatalf("Job name is %d characters", len(job.Name))
+	container := job.Spec.Template.Spec.Containers[0]
+	if container.Image != "example.invalid/runtime:test" {
+		t.Fatalf("image = %q", container.Image)
 	}
-	if job.Annotations["flatheadmill.github.io/delivery"] != "delivery-123" {
-		t.Fatalf("delivery annotation = %q", job.Annotations["flatheadmill.github.io/delivery"])
+	if got := strings.Join(container.Command, " "); got != "/bin/sh -c" {
+		t.Fatalf("command = %q", got)
 	}
-	if job.Spec.Template.Spec.ServiceAccountName != "coalesce-runner" {
-		t.Fatalf("service account = %q", job.Spec.Template.Spec.ServiceAccountName)
+	if container.WorkingDir != "/run/pipeline" {
+		t.Fatalf("working directory = %q", container.WorkingDir)
+	}
+	if !strings.Contains(container.Args[0], "exec ./run") {
+		t.Fatalf("args = %q", container.Args[0])
 	}
 
-	container := job.Spec.Template.Spec.Containers[0]
-	env := make(map[string]string)
-	for _, variable := range container.Env {
-		env[variable.Name] = variable.Value
-	}
+	env := environmentMap(container.Env)
 	want := map[string]string{
-		"GITHUB_ACTION":     "synchronize",
-		"GITHUB_REPOSITORY": "Example_Inc/Secrets.Site",
-		"GITHUB_PR_NUMBER":  "42",
-		"GITHUB_BASE_REF":   "main",
-		"GITHUB_BASE_SHA":   strings.Repeat("a", 40),
-		"GITHUB_HEAD_REF":   "Topic/Build_It",
-		"GITHUB_HEAD_SHA":   strings.Repeat("b", 40),
+		"COALESCE_NAMESPACE":          "coalesce",
+		"COALESCE_PIPELINE":           "secrets-build",
+		"COALESCE_SLUG":               "secrets-site-pull-request-synchronize-1754000000",
+		"COALESCE_URL":                "http://coalesce.coalesce.svc.cluster.local",
+		"GITHUB_DELIVERY":             "delivery-123",
+		"GITHUB_EVENT":                "pull_request.synchronize",
+		"GITHUB_WEBHOOK_PAYLOAD_FILE": webhookPayloadPath,
 	}
 	for name, value := range want {
 		if env[name] != value {
 			t.Errorf("%s = %q, want %q", name, env[name], value)
 		}
 	}
-	if got := container.Args[len(container.Args)-1]; got != "/run/coalesce/pipelines/build.coalesce.zsh" {
-		t.Fatalf("pipeline argument = %q", got)
+	if _, ok := env["GITHUB_WEBHOOK_PAYLOAD"]; ok {
+		t.Error("raw payload remained in the container environment")
+	}
+
+	volume := job.Spec.Template.Spec.Volumes[0]
+	if volume.ConfigMap.Name != "secrets-build" {
+		t.Fatalf("pipeline ConfigMap = %q", volume.ConfigMap.Name)
+	}
+	if volume.ConfigMap.Items[0].Key != pipelineArchiveKey {
+		t.Fatalf("archive key = %q", volume.ConfigMap.Items[0].Key)
+	}
+	if got := job.Spec.Template.Annotations[webhookPayloadAnnotation]; got != string(body) {
+		t.Fatalf("payload annotation = %q, want %q", got, body)
+	}
+	webhook := job.Spec.Template.Spec.Volumes[2].DownwardAPI.Items[0]
+	if webhook.Path != "payload.json" {
+		t.Fatalf("payload path = %q", webhook.Path)
+	}
+	wantField := "metadata.annotations['" + webhookPayloadAnnotation + "']"
+	if webhook.FieldRef.FieldPath != wantField {
+		t.Fatalf("payload fieldRef = %q, want %q",
+			webhook.FieldRef.FieldPath, wantField)
 	}
 }
 
-func TestReceiverTreatsRedeliveryAsSuccess(t *testing.T) {
-	handler, _ := testReceiver(t, 1<<20)
-	body := validPayload("Example_Inc/Secrets.Site")
+func TestReceiverDispatchesBareEvent(t *testing.T) {
+	handler, client, pipelines := testReceiver(t, 1<<20)
+	pipelines.upsert(pipelineConfigMap(
+		"secrets-build",
+		"example_inc/secrets.site",
+		"push",
+	))
+	body := []byte(`{"repository":{"full_name":"Example_Inc/Secrets.Site"},"ref":"refs/heads/main"}`)
+	response := httptest.NewRecorder()
 
-	first := httptest.NewRecorder()
-	handler.ServeHTTP(first, signedRequest(t, "pull_request", body, testSecret))
-	if first.Code != http.StatusCreated {
-		t.Fatalf("first status = %d", first.Code)
+	handler.ServeHTTP(response, signedRequest(t, "push", body, testSecret))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := environmentMap(jobs.Items[0].Spec.Template.Spec.Containers[0].Env)["GITHUB_EVENT"]
+	if got != "push" {
+		t.Fatalf("GITHUB_EVENT = %q", got)
+	}
+}
+
+func TestReceiverDoesNotDeduplicate(t *testing.T) {
+	handler, client, _ := testReceiver(t, 1<<20)
+	next := testNow
+	handler.now = func() time.Time {
+		current := next
+		next = next.Add(time.Second)
+		return current
+	}
+	body := validPayload("Example_Inc/Secrets.Site", "synchronize")
+
+	for range 2 {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, signedRequest(t, "pull_request", body, testSecret))
+		if response.Code != http.StatusCreated {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+		}
 	}
 
-	second := httptest.NewRecorder()
-	handler.ServeHTTP(second, signedRequest(t, "pull_request", body, testSecret))
-	if second.Code != http.StatusOK {
-		t.Fatalf("redelivery status = %d, body = %s", second.Code, second.Body)
+	jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(second.Body.String(), `"status":"exists"`) {
-		t.Fatalf("redelivery body = %s", second.Body)
+	if len(jobs.Items) != 2 {
+		t.Fatalf("created %d Jobs, want 2", len(jobs.Items))
+	}
+}
+
+func TestReceiverSurfacesDuplicateClaim(t *testing.T) {
+	handler, client, pipelines := testReceiver(t, 1<<20)
+	pipelines.upsert(pipelineConfigMap(
+		"secrets-build-copy",
+		"example_inc/secrets.site",
+		"pull_request.synchronize",
+	))
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, signedRequest(t, "pull_request",
+		validPayload("Example_Inc/Secrets.Site", "synchronize"), testSecret))
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("created %d Jobs, want one successful claim", len(jobs.Items))
 	}
 }
 
 func TestReceiverAnswersPingWithoutCreatingJob(t *testing.T) {
-	handler, client := testReceiver(t, 1<<20)
+	handler, client, _ := testReceiver(t, 1<<20)
 	response := httptest.NewRecorder()
 
-	handler.ServeHTTP(response, signedRequest(t, "ping", []byte(`{"zen":"keep it logically awesome"}`), testSecret))
+	handler.ServeHTTP(response, signedRequest(t, "ping",
+		[]byte(`{"zen":"keep it logically awesome"}`), testSecret))
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
@@ -114,14 +197,12 @@ func TestReceiverAnswersPingWithoutCreatingJob(t *testing.T) {
 	}
 }
 
-func TestReceiverIgnoresNonBuildPullRequestActions(t *testing.T) {
-	handler, client := testReceiver(t, 1<<20)
-	body := validPayloadWith(t, "Example_Inc/Secrets.Site", func(payload map[string]any) {
-		payload["action"] = "closed"
-	})
+func TestReceiverIgnoresUnclaimedEvent(t *testing.T) {
+	handler, client, _ := testReceiver(t, 1<<20)
 	response := httptest.NewRecorder()
 
-	handler.ServeHTTP(response, signedRequest(t, "pull_request", body, testSecret))
+	handler.ServeHTTP(response, signedRequest(t, "pull_request",
+		validPayload("Example_Inc/Secrets.Site", "closed"), testSecret))
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
@@ -134,43 +215,66 @@ func TestReceiverIgnoresNonBuildPullRequestActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(jobs.Items) != 0 {
-		t.Fatalf("ignored action created %d Jobs", len(jobs.Items))
+		t.Fatalf("ignored event created %d Jobs", len(jobs.Items))
 	}
 }
 
-func TestReceiverMatchesTheWholeRepositoryName(t *testing.T) {
-	handler, client := testReceiver(t, 1<<20)
-	response := httptest.NewRecorder()
-
-	handler.ServeHTTP(response, signedRequest(t, "pull_request",
-		validPayload("Example_Inc/Secrets.Site-evil"), testSecret))
-
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+func TestPipelineCacheTracksArrivalUpdateAndDeparture(t *testing.T) {
+	pipelines := newPipelineCache("example_inc")
+	configMap := pipelineConfigMap(
+		"secrets-build",
+		"example_inc/secrets.site",
+		"pull_request.opened",
+	)
+	pipelines.upsert(configMap)
+	if got := pipelines.matching(
+		"example_inc/secrets.site",
+		"pull_request.opened",
+	); len(got) != 1 {
+		t.Fatalf("arrival produced %d matches", len(got))
 	}
-	jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
-	if err != nil {
-		t.Fatal(err)
+
+	updated := configMap.DeepCopy()
+	updated.Annotations[pipelineEventsAnnotation] = "pull_request.synchronize"
+	pipelines.upsert(updated)
+	if got := pipelines.matching(
+		"example_inc/secrets.site",
+		"pull_request.opened",
+	); len(got) != 0 {
+		t.Fatalf("old event produced %d matches after update", len(got))
 	}
-	if len(jobs.Items) != 0 {
-		t.Fatalf("non-exact repository created %d Jobs", len(jobs.Items))
+	if got := pipelines.matching(
+		"example_inc/secrets.site",
+		"pull_request.synchronize",
+	); len(got) != 1 {
+		t.Fatalf("new event produced %d matches after update", len(got))
+	}
+
+	pipelines.delete(updated)
+	if got := pipelines.matching(
+		"example_inc/secrets.site",
+		"pull_request.synchronize",
+	); len(got) != 0 {
+		t.Fatalf("departure left %d matches", len(got))
 	}
 }
 
-func TestReceiverRejectsUnanchoredRepositoryPattern(t *testing.T) {
-	_, err := newReceiver(fake.NewSimpleClientset().BatchV1().Jobs("coalesce"), receiverConfig{
-		Secret:            []byte(testSecret),
-		RepositoryPattern: `example_inc/secrets[.]site`,
-		Namespace:         "coalesce",
-		RunnerImage:       "example.invalid/coalesce-runner:test",
-		PipelineConfigMap: "coalesce-pipeline-secrets",
-		PipelineFile:      "build.coalesce.zsh",
-		CoalesceURL:       "http://coalesce.coalesce.svc.cluster.local",
-		MaxBodyBytes:      1 << 20,
-		APITimeout:        time.Second,
-	})
-	if err == nil || !strings.Contains(err.Error(), "must be anchored") {
-		t.Fatalf("error = %v", err)
+func TestPipelineCacheRejectsIncompleteContract(t *testing.T) {
+	pipelines := newPipelineCache("example_inc")
+	configMap := pipelineConfigMap(
+		"secrets-build",
+		"example_inc/secrets.site",
+		"pull_request.synchronize",
+	)
+	delete(configMap.Annotations, pipelineImageAnnotation)
+
+	pipelines.upsert(configMap)
+
+	if got := pipelines.matching(
+		"example_inc/secrets.site",
+		"pull_request.synchronize",
+	); len(got) != 0 {
+		t.Fatalf("invalid ConfigMap produced %d matches", len(got))
 	}
 }
 
@@ -188,7 +292,7 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 		{
 			name:     "invalid signature",
 			event:    "pull_request",
-			body:     validPayload("Example_Inc/Secrets.Site"),
+			body:     validPayload("Example_Inc/Secrets.Site", "synchronize"),
 			secret:   "wrong",
 			method:   http.MethodPost,
 			want:     http.StatusUnauthorized,
@@ -197,25 +301,25 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 		{
 			name:     "oversized body",
 			event:    "pull_request",
-			body:     validPayload("Example_Inc/Secrets.Site"),
+			body:     validPayload("Example_Inc/Secrets.Site", "synchronize"),
 			secret:   testSecret,
 			method:   http.MethodPost,
 			want:     http.StatusRequestEntityTooLarge,
 			maxBytes: 32,
 		},
 		{
-			name:     "unsupported event",
-			event:    "push",
-			body:     []byte(`{}`),
+			name:     "invalid JSON",
+			event:    "pull_request",
+			body:     []byte(`{`),
 			secret:   testSecret,
 			method:   http.MethodPost,
-			want:     http.StatusUnprocessableEntity,
+			want:     http.StatusBadRequest,
 			maxBytes: 1 << 20,
 		},
 		{
 			name:       "missing delivery ID",
 			event:      "pull_request",
-			body:       validPayload("Example_Inc/Secrets.Site"),
+			body:       validPayload("Example_Inc/Secrets.Site", "synchronize"),
 			secret:     testSecret,
 			method:     http.MethodPost,
 			want:       http.StatusBadRequest,
@@ -223,9 +327,9 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 			noDelivery: true,
 		},
 		{
-			name:     "repository not allowed",
+			name:     "wrong organization",
 			event:    "pull_request",
-			body:     validPayload("someone/else"),
+			body:     validPayload("someone/else", "synchronize"),
 			secret:   testSecret,
 			method:   http.MethodPost,
 			want:     http.StatusForbidden,
@@ -234,44 +338,16 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 		{
 			name:     "wrong method",
 			event:    "pull_request",
-			body:     validPayload("Example_Inc/Secrets.Site"),
+			body:     validPayload("Example_Inc/Secrets.Site", "synchronize"),
 			secret:   testSecret,
 			method:   http.MethodGet,
 			want:     http.StatusMethodNotAllowed,
 			maxBytes: 1 << 20,
 		},
 		{
-			name:  "mismatched pull request number",
-			event: "pull_request",
-			body: validPayloadWith(t, "Example_Inc/Secrets.Site", func(payload map[string]any) {
-				payload["number"] = float64(41)
-			}),
-			secret:   testSecret,
-			method:   http.MethodPost,
-			want:     http.StatusUnprocessableEntity,
-			maxBytes: 1 << 20,
-		},
-		{
-			name:  "invalid head SHA",
-			event: "pull_request",
-			body: validPayloadWith(t, "Example_Inc/Secrets.Site", func(payload map[string]any) {
-				pullRequest := payload["pull_request"].(map[string]any)
-				head := pullRequest["head"].(map[string]any)
-				head["sha"] = "not-a-sha"
-			}),
-			secret:   testSecret,
-			method:   http.MethodPost,
-			want:     http.StatusUnprocessableEntity,
-			maxBytes: 1 << 20,
-		},
-		{
-			name:  "invalid Git ref",
-			event: "pull_request",
-			body: validPayloadWith(t, "Example_Inc/Secrets.Site", func(payload map[string]any) {
-				pullRequest := payload["pull_request"].(map[string]any)
-				head := pullRequest["head"].(map[string]any)
-				head["ref"] = "-looks-like-an-option"
-			}),
+			name:     "invalid repository",
+			event:    "pull_request",
+			body:     validPayload("not-an-owner-name", "synchronize"),
 			secret:   testSecret,
 			method:   http.MethodPost,
 			want:     http.StatusUnprocessableEntity,
@@ -281,7 +357,7 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			handler, client := testReceiver(t, test.maxBytes)
+			handler, client, _ := testReceiver(t, test.maxBytes)
 			request := signedRequest(t, test.event, test.body, test.secret)
 			request.Method = test.method
 			if test.noDelivery {
@@ -292,9 +368,13 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 			handler.ServeHTTP(response, request)
 
 			if response.Code != test.want {
-				t.Fatalf("status = %d, want %d, body = %s", response.Code, test.want, response.Body)
+				t.Fatalf("status = %d, want %d, body = %s",
+					response.Code, test.want, response.Body)
 			}
-			jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
+			jobs, err := client.BatchV1().Jobs("coalesce").List(
+				t.Context(),
+				metav1.ListOptions{},
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -305,47 +385,93 @@ func TestReceiverRejectsBadRequestsBeforeCreatingJob(t *testing.T) {
 	}
 }
 
-func TestJobNameSeparatesSanitizationCollisions(t *testing.T) {
-	head := strings.Repeat("c", 40)
-	first := jobName("owner/foo_bar", 7, head)
-	second := jobName("owner/foo.bar", 7, head)
-
-	if first == second {
-		t.Fatalf("colliding repositories produced %q", first)
+func TestRunSlugIsStructuralAndBounded(t *testing.T) {
+	first := runSlug("owner/foo_bar", "pull_request.opened", testNow)
+	second := runSlug("owner/foo.bar", "pull_request.opened", testNow)
+	if first != second {
+		t.Fatalf("sanitization collision was engineered apart: %q != %q", first, second)
 	}
-	for _, name := range []string{first, second} {
-		if len(name) > 63 {
-			t.Errorf("%q is %d characters", name, len(name))
-		}
-		if problems := validation.IsDNS1123Label(name); len(problems) != 0 {
-			t.Errorf("%q is invalid: %v", name, problems)
-		}
+
+	long := runSlug("owner/"+strings.Repeat("a", 100), "pull_request.synchronize", testNow)
+	if len(long) > 63 {
+		t.Fatalf("%q is %d characters", long, len(long))
+	}
+	if problems := validation.IsDNS1123Label(long); len(problems) != 0 {
+		t.Fatalf("%q is invalid: %v", long, problems)
 	}
 }
 
-func testReceiver(t *testing.T, maxBodyBytes int64) (*receiver, *fake.Clientset) {
+func TestRunSlugSeparatesQualifiedEvents(t *testing.T) {
+	opened := runSlug("owner/repository", "pull_request.opened", testNow)
+	labeled := runSlug("owner/repository", "pull_request.labeled", testNow)
+	if opened == labeled {
+		t.Fatalf("qualified events produced the same slug %q", opened)
+	}
+}
+
+func testReceiver(
+	t *testing.T,
+	maxBodyBytes int64,
+) (*receiver, *fake.Clientset, *pipelineCache) {
 	t.Helper()
 	client := fake.NewSimpleClientset()
-	handler, err := newReceiver(client.BatchV1().Jobs("coalesce"), receiverConfig{
-		Secret:            []byte(testSecret),
-		RepositoryPattern: `^example_inc/secrets[.]site$`,
-		Namespace:         "coalesce",
-		RunnerImage:       "example.invalid/coalesce-runner:test",
-		PipelineConfigMap: "coalesce-pipeline-secrets",
-		PipelineFile:      "build.coalesce.zsh",
-		CoalesceURL:       "http://coalesce.coalesce.svc.cluster.local",
-		MaxBodyBytes:      maxBodyBytes,
-		APITimeout:        time.Second,
-	})
+	pipelines := newPipelineCache("example_inc")
+	pipelines.upsert(pipelineConfigMap(
+		"secrets-build",
+		"example_inc/secrets.site",
+		"pull_request.opened,pull_request.reopened,pull_request.synchronize",
+	))
+	handler, err := newReceiver(
+		client.BatchV1().Jobs("coalesce"),
+		pipelines,
+		receiverConfig{
+			Secret:       []byte(testSecret),
+			Organization: "example_inc",
+			Namespace:    "coalesce",
+			CoalesceURL:  "http://coalesce.coalesce.svc.cluster.local",
+			MaxBodyBytes: maxBodyBytes,
+			APITimeout:   time.Second,
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return handler, client
+	handler.now = func() time.Time { return testNow }
+	return handler, client, pipelines
+}
+
+func pipelineConfigMap(name, repository, events string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "coalesce",
+			Labels: map[string]string{
+				pipelineLabel: "",
+			},
+			Annotations: map[string]string{
+				pipelineRepositoryAnnotation: repository,
+				pipelineEventsAnnotation:     events,
+				pipelineImageAnnotation:      "example.invalid/runtime:test",
+			},
+		},
+		BinaryData: map[string][]byte{
+			pipelineArchiveKey: []byte("tar bytes"),
+		},
+	}
+}
+
+func environmentMap(environment []corev1.EnvVar) map[string]string {
+	values := make(map[string]string, len(environment))
+	for _, variable := range environment {
+		values[variable.Name] = variable.Value
+	}
+	return values
 }
 
 func signedRequest(t *testing.T, event string, body []byte, secret string) *http.Request {
 	t.Helper()
-	request := httptest.NewRequest(http.MethodPost, webhookPath, strings.NewReader(string(body)))
+	request := httptest.NewRequest(http.MethodPost, webhookPath,
+		strings.NewReader(string(body)))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-GitHub-Delivery", "delivery-test")
 	request.Header.Set("X-GitHub-Event", event)
@@ -359,29 +485,10 @@ func signature(secret, body []byte) string {
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
-func validPayload(repository string) []byte {
+func validPayload(repository, action string) []byte {
 	return []byte(fmt.Sprintf(`{
-		"action": "synchronize",
-		"number": 42,
+		"action": %q,
 		"repository": {"full_name": %q},
-		"pull_request": {
-			"number": 42,
-			"base": {"ref": "main", "sha": %q},
-			"head": {"ref": "Topic/Build_It", "sha": %q}
-		}
-	}`, repository, strings.Repeat("a", 40), strings.Repeat("b", 40)))
-}
-
-func validPayloadWith(t *testing.T, repository string, change func(map[string]any)) []byte {
-	t.Helper()
-	var payload map[string]any
-	if err := json.Unmarshal(validPayload(repository), &payload); err != nil {
-		t.Fatal(err)
-	}
-	change(payload)
-	body, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return body
+		"contributor_input": "$(touch /tmp/not-code)"
+	}`, action, repository))
 }

@@ -383,7 +383,8 @@ function :execute:run {
         -d "{\"dag\": $dag_json}" > /dev/null || abend 'unable to reach storage'
     curl -s -X POST "${_coalesce_url}/api/${o_namespace}/runs/${o_slug}" \
         -H 'Content-Type: application/json' \
-        -d "$(jo pipeline=$1)" > /dev/null || abend 'unable to reach storage'
+        -d "$(jo pipeline="${COALESCE_PIPELINE_NAME:-$1}")" > /dev/null ||
+        abend 'unable to reach storage'
     _coalesce_run_started=1
     _coalesce_run
     _coalesce_run_status=${_coalesce[coalesce:status]:-failed}
