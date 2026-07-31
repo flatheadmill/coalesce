@@ -88,7 +88,7 @@ function _coalesce_job_yaml {
         return 1
     fi
     typeset labels=$(
-        jo -- flatheadmill.github.io/job=$job flatheadmill.github.io/slug=$o_slug
+        jo -- coalesce.flatheadmill.com/job=$job coalesce.flatheadmill.com/slug=$o_slug
     )
     # imagePullSecrets is optional: emitted only when COALESCE_IMAGE_PULL_SECRET
     # names the secret, so public-image and OrbStack runs stay untouched while a
@@ -304,7 +304,7 @@ function _coalesce_run {
     _coalesce_run_start_jobs
     integer fd child entries over
     while (( ! _coalesce[over] )); do
-        coproc kubectl get jobs --namespace $o_namespace -l flatheadmill.github.io/slug=$o_slug \
+        coproc kubectl get jobs --namespace $o_namespace -l coalesce.flatheadmill.com/slug=$o_slug \
             --watch --output-watch-events --output json
         child=${!}
         _coalesce_children+=( $child )
@@ -343,7 +343,7 @@ function _coalesce_run {
                 case $outcome in
                 (Pending|SuccessCriteriaMet) ;;
                 (Failed)
-                    typeset failed_job=$labels[flatheadmill.github.io/job]
+                    typeset failed_job=$labels[coalesce.flatheadmill.com/job]
                     if _coalesce_mark_terminal $failed_job failed; then
                         terminal=$failed_job
                         print failed $failed_job
@@ -353,7 +353,7 @@ function _coalesce_run {
                     fi
                     ;;
                 (Complete)
-                    typeset completed_job=$labels[flatheadmill.github.io/job]
+                    typeset completed_job=$labels[coalesce.flatheadmill.com/job]
                     if _coalesce_mark_terminal $completed_job completed; then
                         terminal=$completed_job
                         print complete $completed_job

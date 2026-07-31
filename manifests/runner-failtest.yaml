@@ -23,7 +23,7 @@ spec:
     metadata:
       labels:
         app: coalesce-runner-failtest
-        flatheadmill.github.io/slug: failtest-pr-1-deadbeefcafe
+        coalesce.flatheadmill.com/slug: failtest-pr-1-deadbeefcafe
     spec:
       serviceAccountName: coalesce-runner
       restartPolicy: Never

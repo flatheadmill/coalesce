@@ -422,8 +422,8 @@ func handlePostContainer(w http.ResponseWriter, r *http.Request) {
 // — the watcher will see the pod again on the next list cycle.
 func harvestPodLogs(ctx context.Context, pod *corev1.Pod) {
 	namespace := pod.Namespace
-	slug := pod.Labels["flatheadmill.github.io/slug"]
-	job := pod.Labels["flatheadmill.github.io/job"]
+	slug := pod.Labels["coalesce.flatheadmill.com/slug"]
+	job := pod.Labels["coalesce.flatheadmill.com/job"]
 
 	if slug == "" || job == "" {
 		return
@@ -485,7 +485,7 @@ func watchPodCompletions(ctx context.Context, namespace string) {
 	for {
 		// List first to catch pods that terminated while we weren't watching.
 		pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: "flatheadmill.github.io/slug",
+			LabelSelector: "coalesce.flatheadmill.com/slug",
 		})
 		if err != nil {
 			slog.Error("Failed to list pods for log harvest", "error", err)
@@ -503,7 +503,7 @@ func watchPodCompletions(ctx context.Context, namespace string) {
 		// Watch from the list's resource version so we don't miss anything
 		// between the list and the watch.
 		watcher, err := clientset.CoreV1().Pods(namespace).Watch(ctx, metav1.ListOptions{
-			LabelSelector:   "flatheadmill.github.io/slug",
+			LabelSelector:   "coalesce.flatheadmill.com/slug",
 			ResourceVersion: pods.ResourceVersion,
 		})
 		if err != nil {
@@ -767,7 +767,7 @@ func handleTailLogs(w http.ResponseWriter, r *http.Request) {
 
 	// Find the pod by the labels the executor sets when creating Jobs.
 	pods, err := clientset.CoreV1().Pods(namespace).List(r.Context(), metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("flatheadmill.github.io/slug=%s,flatheadmill.github.io/job=%s", slug, job),
+		LabelSelector: fmt.Sprintf("coalesce.flatheadmill.com/slug=%s,coalesce.flatheadmill.com/job=%s", slug, job),
 	})
 	if err != nil {
 		slog.Error("Failed to list pods", "error", err, "namespace", namespace, "slug", slug, "job", job)

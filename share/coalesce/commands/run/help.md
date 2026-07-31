@@ -21,8 +21,8 @@ job completes, completion propagates up the DAG. The executor recalculates
 which jobs are runnable given parallelism constraints and launches the next
 batch. The loop continues until all steps are complete.
 
-Jobs are labeled with `flatheadmill.github.io/slug` and
-`flatheadmill.github.io/job` to identify which pipeline and step they belong
+Jobs are labeled with `coalesce.flatheadmill.com/slug` and
+`coalesce.flatheadmill.com/job` to identify which pipeline and step they belong
 to. The slug comes from the `--slug` option passed to the root command.
 ## OPTIONS
 > options

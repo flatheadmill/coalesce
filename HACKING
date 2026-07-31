@@ -146,7 +146,7 @@ The executor runs on the Mac and creates Jobs in the OrbStack cluster:
     ./bin/coalesce -s test-fanout run test/fanout.coalesce.zsh
 
 The -s flag sets the slug and goes before the subcommand. Jobs are labeled
-with flatheadmill.github.io/slug and flatheadmill.github.io/job for
+with coalesce.flatheadmill.com/slug and coalesce.flatheadmill.com/job for
 identification.
 
 ---

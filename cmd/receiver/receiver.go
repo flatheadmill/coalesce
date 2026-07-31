@@ -27,12 +27,12 @@ import (
 const (
 	webhookPath = "/webhooks/github"
 
-	pipelineLabel                = "flatheadmill.github.io/pipeline"
-	pipelineRepositoryAnnotation = "flatheadmill.github.io/repository"
-	pipelineEventsAnnotation     = "flatheadmill.github.io/events"
-	pipelineImageAnnotation      = "flatheadmill.github.io/image"
+	pipelineLabel                = "coalesce.flatheadmill.com/pipeline"
+	pipelineRepositoryAnnotation = "coalesce.flatheadmill.com/repository"
+	pipelineEventsAnnotation     = "coalesce.flatheadmill.com/events"
+	pipelineImageAnnotation      = "coalesce.flatheadmill.com/image"
 	pipelineArchiveKey           = "pipeline.tar.gz"
-	webhookPayloadAnnotation     = "flatheadmill.github.io/webhook-payload"
+	webhookPayloadAnnotation     = "coalesce.flatheadmill.com/webhook-payload"
 	webhookPayloadPath           = "/run/webhook/payload.json"
 )
 
@@ -514,14 +514,14 @@ func (receiver *receiver) job(
 			Name:      slug,
 			Namespace: receiver.config.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/name":      "coalesce-dispatch",
-				"flatheadmill.github.io/slug": slug,
+				"app.kubernetes.io/name":         "coalesce-dispatch",
+				"coalesce.flatheadmill.com/slug": slug,
 			},
 			Annotations: map[string]string{
-				pipelineRepositoryAnnotation:      pipeline.Repository,
-				"flatheadmill.github.io/event":    event,
-				"flatheadmill.github.io/delivery": delivery,
-				pipelineLabel:                     pipeline.Name,
+				pipelineRepositoryAnnotation:         pipeline.Repository,
+				"coalesce.flatheadmill.com/event":    event,
+				"coalesce.flatheadmill.com/delivery": delivery,
+				pipelineLabel:                        pipeline.Name,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -530,8 +530,8 @@ func (receiver *receiver) job(
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app.kubernetes.io/name":      "coalesce-dispatch",
-						"flatheadmill.github.io/slug": slug,
+						"app.kubernetes.io/name":         "coalesce-dispatch",
+						"coalesce.flatheadmill.com/slug": slug,
 					},
 					Annotations: map[string]string{
 						webhookPayloadAnnotation: string(payload),

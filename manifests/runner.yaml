@@ -171,7 +171,7 @@ spec:
     metadata:
       labels:
         app: coalesce-runner
-        flatheadmill.github.io/slug: secrets-pr-8-c60e3a8448af
+        coalesce.flatheadmill.com/slug: secrets-pr-8-c60e3a8448af
     spec:
       serviceAccountName: coalesce-runner
       restartPolicy: Never
