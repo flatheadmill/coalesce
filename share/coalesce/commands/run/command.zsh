@@ -78,8 +78,15 @@ function _coalesce_job_yaml {
     typeset job=${1:-}
     shift
     typeset o_yaml
-    "${(@QA)${(z)_coalesce[${job}:args]}}"
+    if ! "${(@QA)${(z)_coalesce[${job}:args]}}"; then
+        print -u2 "cannot create $job: Job manifest command failed"
+        return 1
+    fi
     typeset name=${o_slug}-$(_coalesce_cksum $o_slug.$job)-${job##*.}
+    if (( ${#name} > 63 )); then
+        print -u2 "cannot create $job: derived Job name '$name' is ${#name} characters; Kubernetes labels allow 63"
+        return 1
+    fi
     typeset labels=$(
         jo -- flatheadmill.github.io/job=$job flatheadmill.github.io/slug=$o_slug
     )
@@ -241,18 +248,39 @@ function _coalesce_descend_jobs {
 }
 
 # Launch runnable pods. The :ran check enables resume — if we loaded state
-# from PostgreSQL at startup, already-completed jobs are skipped.
+# from PostgreSQL at startup, already-completed jobs are skipped. A rejected
+# Job is a failed node, not a reason to wait forever for a watch event that can
+# never arrive. Drain immediate failures here so independent work still runs
+# and a run with no successfully created Jobs can unwind without opening a
+# watch.
 function _coalesce_run_start_jobs {
-    typeset job
+    typeset job current=()
     typeset -A k8s
-    for job in "${(@)runnable}"; do
-        (( ${+_coalesce[${job}:ran]} )) && continue
-        _coalesce_job_yaml $job
-        # TODO Check with app if there is a metadata.json.
-        kubectl apply --namespace $o_namespace -f - <<< $k8s[yaml]
-        _coalesce[${job}:ran]=1
-        curl -s -X POST "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${job}" \
-            -H 'Content-Type: application/json' -d '{}' > /dev/null
+    integer create_failed
+    while (( ${#runnable} )); do
+        current=( "${(@)runnable}" )
+        runnable=()
+        create_failed=0
+        for job in "${(@)current}"; do
+            (( ${+_coalesce[${job}:ran]} )) && continue
+            _coalesce[${job}:ran]=1
+            curl -s -X POST "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${job}" \
+                -H 'Content-Type: application/json' -d '{}' > /dev/null
+            # TODO Check with app if there is a metadata.json.
+            if _coalesce_job_yaml $job &&
+                    kubectl apply --namespace $o_namespace -f - <<< $k8s[yaml]; then
+                continue
+            fi
+            create_failed=1
+            if _coalesce_mark_terminal $job failed; then
+                print failed $job
+                curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${job}" \
+                    -H 'Content-Type: application/json' \
+                    -d '{"status": "failed"}' > /dev/null
+            fi
+        done
+        (( create_failed && ! _coalesce[over] )) || break
+        _coalesce_descend_jobs coalesce
     done
 }
 

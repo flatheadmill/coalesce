@@ -630,19 +630,24 @@ func runSlug(repository, event string, at time.Time) string {
 	if err != nil {
 		panic(err)
 	}
-	suffix := fmt.Sprintf("-%d", at.Unix())
-	visible := sanitizeDNSLabel(name + "-" + event)
-	// A slug that fills this budget leaves the executor no room, since it names
-	// each child Job slug-checksum-step. That is a known limit rather than a
-	// defended one: it needs a long repository name, and it fails at child
-	// creation on the first delivery for that repository, which is visible and
-	// deterministic. Reserving room here instead would truncate the qualified
-	// event, and the event is why two same-second deliveries stay distinct.
-	maxVisible := 63 - len(suffix)
-	if len(visible) > maxVisible {
-		visible = strings.Trim(visible[:maxVisible], "-")
+	epoch := fmt.Sprintf("-%d", at.Unix())
+	qualifiedEvent := sanitizeDNSLabel(event)
+	// This receiver currently launches one step named build. Its executor Job
+	// adds "-" + eight CRC32 hex digits + "-build" to this slug, so the slug is
+	// not the last derived Kubernetes name and must leave that concrete room.
+	// A future pipeline with a longer leaf is rejected where the executor knows
+	// the actual name rather than making every repository pay for a guessed cap.
+	const buildJobSuffixBudget = len("-ffffffff-build")
+	maxSlug := 63 - buildJobSuffixBudget
+	nameBudget := maxSlug - len(epoch) - len(qualifiedEvent) - 1
+	if nameBudget < 1 {
+		panic(fmt.Sprintf("qualified event %q leaves no room for a repository slug", event))
 	}
-	slug := visible + suffix
+	visibleName := sanitizeDNSLabel(name)
+	if len(visibleName) > nameBudget {
+		visibleName = strings.Trim(visibleName[:nameBudget], "-")
+	}
+	slug := visibleName + "-" + qualifiedEvent + epoch
 	if problems := validation.IsDNS1123Label(slug); len(problems) != 0 {
 		panic(fmt.Sprintf("generated invalid slug %q: %s",
 			slug, strings.Join(problems, ", ")))

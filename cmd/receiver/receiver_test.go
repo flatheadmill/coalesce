@@ -504,11 +504,19 @@ func TestRunSlugIsStructuralAndBounded(t *testing.T) {
 	}
 
 	long := runSlug("owner/"+strings.Repeat("a", 100), "pull_request.synchronize", testNow)
-	if len(long) > 63 {
+	if len(long) > 48 {
 		t.Fatalf("%q is %d characters", long, len(long))
 	}
 	if problems := validation.IsDNS1123Label(long); len(problems) != 0 {
 		t.Fatalf("%q is invalid: %v", long, problems)
+	}
+	wantSuffix := fmt.Sprintf("-pull-request-synchronize-%d", testNow.Unix())
+	if !strings.HasSuffix(long, wantSuffix) {
+		t.Fatalf("qualified event or epoch was truncated in %q", long)
+	}
+	childName := long + "-ffffffff-build"
+	if len(childName) > 63 {
+		t.Fatalf("reserved child name %q is %d characters", childName, len(childName))
 	}
 }
 
