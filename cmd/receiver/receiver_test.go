@@ -58,9 +58,9 @@ func TestReceiverDispatchesRawPayload(t *testing.T) {
 	if got := strings.Join(container.Command, " "); got != "tini -g -- zsh -c" {
 		t.Fatalf("command = %q", got)
 	}
-	// A pipeline naming no sources still leads its own list, because it is the
-	// one carrying the run the bench looks for.
-	if got := strings.Join(container.Args, " "); got != "exec bench secrets-build" {
+	// The program is the same constant in every Job; the variance is data in
+	// the environment, asserted below.
+	if got := strings.Join(container.Args, " "); got != layoutScript {
 		t.Fatalf("command line = %q", got)
 	}
 	if got := mountPath(container.VolumeMounts, "source-0"); got != benchRoot+"/mnt/secrets-build" {
@@ -74,6 +74,7 @@ func TestReceiverDispatchesRawPayload(t *testing.T) {
 	want := map[string]string{
 		"COALESCE_NAMESPACE":          "coalesce",
 		"COALESCE_PIPELINE":           "secrets-build",
+		"COALESCE_SOURCES":            "secrets-build",
 		"COALESCE_SLUG":               "secrets-site-pull-request-synchronize-1754000000",
 		"COALESCE_URL":                "http://coalesce.coalesce.svc.cluster.local",
 		"GITHUB_DELIVERY":             "delivery-123",
@@ -89,9 +90,10 @@ func TestReceiverDispatchesRawPayload(t *testing.T) {
 		t.Error("raw payload remained in the container environment")
 	}
 
-	// The whole ConfigMap is mounted rather than a named key, because sources
-	// call their archives different things and the bench takes the one that is
-	// there.
+	// The whole ConfigMap is mounted rather than a named key. Every source
+	// carries ball.tar.gz, but selecting it with items would turn a wrong key
+	// into a mount that never resolves and a Pod stuck ContainerCreating;
+	// mounting whole lets tar fail fast and name the missing path.
 	volume := volumeNamed(job.Spec.Template.Spec.Volumes, "source-0")
 	if volume.ConfigMap == nil || volume.ConfigMap.Name != "secrets-build" {
 		t.Fatalf("pipeline source volume = %+v", volume.VolumeSource)
@@ -138,10 +140,12 @@ func TestReceiverDispatchesBareEvent(t *testing.T) {
 	}
 }
 
-// A pipeline that calls a command tree names it as a source, and the whole cost
-// of that on the receiver's side is one more mount and one more argument. The
-// order is the contract: the pipeline leads, because the bench runs the first
-// source carrying a run.
+// A pipeline that calls a library names it as a source, and the whole cost of
+// that on the receiver's side is one more mount and one more word in
+// COALESCE_SOURCES. The order asserted here is the order the list is built in,
+// not a contract the script depends on — it cds into COALESCE_PIPELINE, which
+// arrives separately. What the order buys is a readable list and a mount whose
+// position matches it.
 func TestReceiverMountsNamedSourcesInOrder(t *testing.T) {
 	handler, client, pipelines := testReceiver(t, 1<<20)
 	configMap := pipelineConfigMap(
@@ -167,8 +171,9 @@ func TestReceiverMountsNamedSourcesInOrder(t *testing.T) {
 	container := pod.Containers[0]
 	// The pipeline names itself among its sources; it is still listed once, and
 	// still first.
-	if got := strings.Join(container.Args, " "); got != "exec bench secrets-build millwright toolbelt" {
-		t.Fatalf("command line = %q", got)
+	sources := environmentMap(container.Env)["COALESCE_SOURCES"]
+	if sources != "secrets-build millwright toolbelt" {
+		t.Fatalf("COALESCE_SOURCES = %q", sources)
 	}
 	for index, source := range []string{"secrets-build", "millwright", "toolbelt"} {
 		volume := fmt.Sprintf("source-%d", index)
@@ -638,7 +643,7 @@ func pipelineConfigMap(name, repository, events string) *corev1.ConfigMap {
 			},
 		},
 		BinaryData: map[string][]byte{
-			pipelineArchiveKey: []byte("tar bytes"),
+			archiveKey: []byte("tar bytes"),
 		},
 	}
 }

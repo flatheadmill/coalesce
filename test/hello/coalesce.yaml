@@ -1,0 +1,9 @@
+name: hello
+namespace: coalesce
+labels:
+  "coalesce.flatheadmill.com/pipeline": ""
+annotations:
+  "coalesce.flatheadmill.com/repository": example/coalesce-hello
+  "coalesce.flatheadmill.com/events": pull_request.opened
+  "coalesce.flatheadmill.com/image": harbor.example.org/example/coalesce-runner:latest
+  "coalesce.flatheadmill.com/sources": library

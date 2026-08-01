@@ -3,12 +3,15 @@
 # The runner is Coalesce's Zsh executor inside Kubernetes, not another
 # workstation image. Millwright already carries the house shell runtime and
 # every external command the executor and build pipeline need; this layer adds
-# Coalesce's command tree, the bench that lays out a pod's sources, and tini.
+# Coalesce's command tree and tini.
 #
-# No entry point. A Job says what it runs, in the pod spec, where you can read
-# it — `zsh -c` and a command line, the same as everywhere else. An entry point
-# would put the first half of that command somewhere the manifest does not show,
-# so a Job that looked complete would be running something you could not see.
+# No entry point, and no layout helper either. A Job carries its whole layout
+# program in its own args, where the manifest shows it — the receiver emits a
+# constant script needing only tini, zsh, and tar, so no Coalesce code on the
+# parent path is baked into this image and the receiver and this image may
+# deploy in any order. An entry point would put the first half of that command
+# somewhere the manifest does not show, so a Job that looked complete would be
+# running something you could not see.
 #
 # tini is here to be named in that command line. It forwards TERM to the whole
 # foreground process group, which releases Zsh from a blocking curl or kubectl
@@ -22,7 +25,6 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends tini \
  && rm -rf /var/lib/apt/lists/*
 COPY --chmod=0755 bin/coalesce /usr/bin/coalesce
-COPY --chmod=0755 bin/bench /usr/bin/bench
 COPY share/coalesce /usr/share/coalesce
 
 USER linuxbrew

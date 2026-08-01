@@ -9,7 +9,13 @@ function :args:make {
 # labels, annotations, anything Kubernetes accepts there — arrives untouched, so
 # this command never has to learn what a pipeline label means. The descriptor
 # rides inside the archive too, which costs nothing and leaves the artifact able
-# to describe itself.
+# to describe itself. A directory with a claim label and a run is a pipeline; a
+# directory with neither is a library; this command renders both and cannot
+# tell them apart, which is the point.
+#
+# The key is ball.tar.gz for every source, pipeline or library. This is the one
+# renderer and it stamps the one name the Job's layout script insists on — the
+# loop is closed, so there is no second producer to accommodate.
 #
 # binaryData is printed rather than rendered, because a YAML writer is entitled
 # to fold a long scalar and Kubernetes will not accept a folded base64 payload.
@@ -31,7 +37,7 @@ function :execute:make {
         print -r -- 'metadata:'
         gojq --yaml-input --yaml-output '.' < $file/coalesce.yaml | sed 's/^/  /'
         print -r -- 'binaryData:'
-        print -nr -- '  pipeline.tar.gz: '
+        print -nr -- '  ball.tar.gz: '
         (
             cd $file
             find . -type f -print | LC_ALL=C sort |

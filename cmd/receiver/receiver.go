@@ -32,15 +32,45 @@ const (
 	pipelineEventsAnnotation     = "coalesce.flatheadmill.com/events"
 	pipelineImageAnnotation      = "coalesce.flatheadmill.com/image"
 	pipelineSourcesAnnotation    = "coalesce.flatheadmill.com/sources"
-	pipelineArchiveKey           = "pipeline.tar.gz"
 	webhookPayloadAnnotation     = "coalesce.flatheadmill.com/webhook-payload"
 	webhookPayloadPath           = "/run/webhook/payload.json"
 
-	// The bench lays out every source tree before the pipeline runs, so the
-	// receiver's whole contribution is mounting the archives where it looks and
-	// naming them in order. It knows nothing about what a source contains.
+	// Every source carries exactly one archive and it is named ball.tar.gz,
+	// because coalesce make is the one renderer and stamps the one name. The
+	// loop is closed — one producer, one consumer, both in this house — so the
+	// layout below insists on the name rather than globbing for whatever might
+	// be there. A hand-rolled ConfigMap with a different key fails loudly at
+	// tar with the missing path in the message, and the answer to "it needs a
+	// specific name" is: yes, and? Use coalesce make.
+	archiveKey = "ball.tar.gz"
+
 	benchRoot = "/run/coalesce"
 )
+
+// The layout program is a constant, identical in every Job the receiver has
+// ever created, and the manifest shows all of it — no entry point, no helper
+// baked into an image, nothing running that kubectl get job -o yaml does not
+// display. The per-Job variance rides in the environment: COALESCE_SOURCES is
+// the list to lay out, COALESCE_PIPELINE the tree whose run starts. Data
+// never enters program text, so there is nothing to escape and no injection
+// class to argue about — the environment cannot become syntax no matter what
+// it contains. ${=COALESCE_SOURCES} is Zsh's explicit word split, visibly
+// overriding its refusal to split unquoted parameters.
+//
+// The only tools the script needs are tini, zsh, tar — furniture present in
+// every image this house has ever built — so the receiver and the runner
+// image may deploy in any order.
+// The loop body is indented with tabs because this is a Go file and the house
+// checks Go files for space indentation, string literal or not. Zsh does not
+// care, and the manifest reads the same.
+const layoutScript = `setopt errexit
+typeset name
+for name in ${=COALESCE_SOURCES}; do
+	mkdir -p ` + benchRoot + `/src/$name
+	tar -xzf ` + benchRoot + `/mnt/$name/` + archiveKey + ` -C ` + benchRoot + `/src/$name
+done
+cd ` + benchRoot + `/src/$COALESCE_PIPELINE
+exec ./run`
 
 type receiverConfig struct {
 	Secret       []byte
@@ -73,10 +103,12 @@ type pipeline struct {
 	Repository string
 	Image      string
 	Events     map[string]struct{}
-	// Sources is the bench's argument list. The pipeline's own ConfigMap is
-	// always first because it is the one carrying `run`, and the annotation adds
-	// whatever command trees the pipeline calls. A pipeline that needs nothing
-	// but itself names no sources at all.
+	// Sources is the layout list. The script unpacks every name in it and then
+	// cds into COALESCE_PIPELINE, which is carried separately, so the order
+	// here decides nothing — the pipeline is listed first because a list that
+	// opens with the thing being run reads correctly, not because anything
+	// depends on it. The annotation adds whatever libraries the pipeline
+	// calls; a pipeline that needs nothing but itself names no sources at all.
 	Sources []string
 }
 
@@ -193,8 +225,8 @@ func pipelineFromConfigMap(configMap *corev1.ConfigMap, organization string) (pi
 		return pipeline{}, fmt.Errorf("annotation %s: %w",
 			pipelineEventsAnnotation, err)
 	}
-	if len(configMap.BinaryData[pipelineArchiveKey]) == 0 {
-		return pipeline{}, fmt.Errorf("binaryData key %s is required", pipelineArchiveKey)
+	if len(configMap.BinaryData[archiveKey]) == 0 {
+		return pipeline{}, fmt.Errorf("binaryData key %s is required", archiveKey)
 	}
 	sources, err := parseSources(configMap.Name,
 		configMap.Annotations[pipelineSourcesAnnotation])
@@ -212,11 +244,11 @@ func pipelineFromConfigMap(configMap *corev1.ConfigMap, organization string) (pi
 	}, nil
 }
 
-// The pipeline leads its own source list because it holds the `run` the bench
-// looks for, and the bench takes the first runnable source it finds. A named
-// source is a ConfigMap in this namespace holding one archive; the receiver
-// never opens it, so a name that does not resolve is a Pod that will not start
-// rather than an error here.
+// The pipeline is always in its own source list, because it has to be laid out
+// like anything else, and it is put there first so the list reads as the thing
+// being run followed by what it calls. A named source is a ConfigMap in this
+// namespace carrying ball.tar.gz; the receiver never opens it, so a name that
+// does not resolve is a Pod that will not start rather than an error here.
 func parseSources(name, value string) ([]string, error) {
 	sources := []string{name}
 	seen := map[string]struct{}{name: {}}
@@ -553,8 +585,8 @@ func (receiver *receiver) job(
 	backoffLimit := int32(0)
 	ttl := int32(3600)
 
-	// One mount per source, at the name the bench will be given. The volume is
-	// named by position because a ConfigMap name may carry dots and a volume
+	// One mount per source, at the name the layout script iterates. The volume
+	// is named by position because a ConfigMap name may carry dots and a volume
 	// name may not; nothing reads the volume name, while the mount path is the
 	// whole interface.
 	mounts := []corev1.VolumeMount{
@@ -638,23 +670,20 @@ func (receiver *receiver) job(
 						Name:            "pipeline",
 						Image:           pipeline.Image,
 						ImagePullPolicy: corev1.PullAlways,
-						// The house shape: zsh -c and a command line you can
-						// read in the manifest. Source names are ConfigMap
-						// names, checked when the pipeline was cached, so the
-						// line cannot carry anything the shell would take as
-						// syntax.
+						// The house shape: zsh -c and a program you can read in
+						// the manifest — the layoutScript constant above, the
+						// same text in every Job, with the variance in env.
 						//
 						// tini leads it because Kubernetes sends TERM to PID 1
 						// alone. Without it a run blocked in a curl or kubectl
 						// finishes that child before its trap runs, and a pod
 						// killed mid-step records nothing.
 						Command: []string{"tini", "-g", "--", "zsh", "-c"},
-						Args: []string{
-							"exec bench " + strings.Join(pipeline.Sources, " "),
-						},
+						Args:    []string{layoutScript},
 						Env: []corev1.EnvVar{
 							{Name: "COALESCE_NAMESPACE", Value: receiver.config.Namespace},
 							{Name: "COALESCE_PIPELINE", Value: pipeline.Name},
+							{Name: "COALESCE_SOURCES", Value: strings.Join(pipeline.Sources, " ")},
 							{Name: "COALESCE_SLUG", Value: slug},
 							{Name: "COALESCE_URL", Value: receiver.config.CoalesceURL},
 							{Name: "GITHUB_DELIVERY", Value: delivery},
