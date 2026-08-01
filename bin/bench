@@ -1,0 +1,60 @@
+#!/bin/zsh
+
+# Lay out a pod's source trees and start the work.
+#
+# A pod that runs a pipeline needs more than its image. It needs the pipeline
+# itself, which changes on every edit, and it needs whatever command trees the
+# pipeline calls, which change on their own schedule. Baking either into the
+# image means rebuilding and pushing to change a line of Zsh, so both arrive as
+# tarballs in ConfigMaps and are laid out here, on the bench, before anything
+# runs.
+#
+# The list is the whole interface. Each name is a source, mounted at mnt/<name>
+# and unpacked to src/<name>. Nothing here knows what a source contains, so a
+# command tree and a repository's pipeline arrive by the same path and neither
+# is a special case. That is what makes generating the Job mechanical: for every
+# name, mount its ConfigMap and add the name to the argument list, and there is
+# nothing else to decide.
+#
+# A source mount holds exactly one archive and the bench takes whatever is
+# there. Sources name their key differently — a pipeline calls it
+# pipeline.tar.gz, a command tree calls it its own name — and neither the bench
+# nor whoever generated the Job has to learn those names. Mount the ConfigMap
+# whole and the one key it carries is the archive.
+#
+# The glob qualifier is `(-.)` rather than `(.)` because a ConfigMap volume
+# presents each key as a symlink into its own `..data` directory, and a plain
+# regular-file test looks at the link instead of its target. Following the link
+# also excludes `..data` itself, which is a symlink to a directory.
+#
+#   bench example-build millwright
+#
+# The runnable source is the one carrying an executable `run` at its root, and
+# the first in the list wins. Two runnable sources is an authoring mistake, not
+# an ambiguity to resolve: the list is written by whoever generated the Job, and
+# they know which one they meant.
+
+setopt errexit pipefail
+
+typeset root=${COALESCE_BENCH:-/run/coalesce}
+typeset name tree runnable=
+typeset -a archive
+
+(( $# )) || { print -u 2 'bench: at least one source is required'; exit 1; }
+
+for name in "$@"; do
+    archive=( $root/mnt/$name/*(-.N) )
+    tree=$root/src/$name
+    (( $#archive == 1 )) || {
+        print -u 2 "bench: source $name holds $#archive archives, expected one"
+        exit 1
+    }
+    mkdir -p $tree
+    tar -xzf $archive[1] -C $tree
+    [[ -n $runnable || ! -x $tree/run ]] || runnable=$tree
+done
+
+[[ -n $runnable ]] || { print -u 2 'bench: no source carries an executable run'; exit 1; }
+
+cd $runnable
+exec ./run

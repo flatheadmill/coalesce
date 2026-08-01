@@ -55,14 +55,19 @@ func TestReceiverDispatchesRawPayload(t *testing.T) {
 	if container.Image != "example.invalid/runtime:test" {
 		t.Fatalf("image = %q", container.Image)
 	}
-	if got := strings.Join(container.Command, " "); got != "/bin/sh -c" {
+	if got := strings.Join(container.Command, " "); got != "tini -g -- zsh -c" {
 		t.Fatalf("command = %q", got)
 	}
-	if container.WorkingDir != "/run/pipeline" {
-		t.Fatalf("working directory = %q", container.WorkingDir)
+	// A pipeline naming no sources still leads its own list, because it is the
+	// one carrying the run the bench looks for.
+	if got := strings.Join(container.Args, " "); got != "exec bench secrets-build" {
+		t.Fatalf("command line = %q", got)
 	}
-	if !strings.Contains(container.Args[0], "exec ./run") {
-		t.Fatalf("args = %q", container.Args[0])
+	if got := mountPath(container.VolumeMounts, "source-0"); got != benchRoot+"/mnt/secrets-build" {
+		t.Fatalf("pipeline source mounted at %q", got)
+	}
+	if got := mountPath(container.VolumeMounts, "src"); got != benchRoot+"/src" {
+		t.Fatalf("source trees mounted at %q", got)
 	}
 
 	env := environmentMap(container.Env)
@@ -84,17 +89,20 @@ func TestReceiverDispatchesRawPayload(t *testing.T) {
 		t.Error("raw payload remained in the container environment")
 	}
 
-	volume := job.Spec.Template.Spec.Volumes[0]
-	if volume.ConfigMap.Name != "secrets-build" {
-		t.Fatalf("pipeline ConfigMap = %q", volume.ConfigMap.Name)
+	// The whole ConfigMap is mounted rather than a named key, because sources
+	// call their archives different things and the bench takes the one that is
+	// there.
+	volume := volumeNamed(job.Spec.Template.Spec.Volumes, "source-0")
+	if volume.ConfigMap == nil || volume.ConfigMap.Name != "secrets-build" {
+		t.Fatalf("pipeline source volume = %+v", volume.VolumeSource)
 	}
-	if volume.ConfigMap.Items[0].Key != pipelineArchiveKey {
-		t.Fatalf("archive key = %q", volume.ConfigMap.Items[0].Key)
+	if len(volume.ConfigMap.Items) != 0 {
+		t.Fatalf("source selected keys %+v", volume.ConfigMap.Items)
 	}
 	if got := job.Spec.Template.Annotations[webhookPayloadAnnotation]; got != string(body) {
 		t.Fatalf("payload annotation = %q, want %q", got, body)
 	}
-	webhook := job.Spec.Template.Spec.Volumes[2].DownwardAPI.Items[0]
+	webhook := volumeNamed(job.Spec.Template.Spec.Volumes, "webhook").DownwardAPI.Items[0]
 	if webhook.Path != "payload.json" {
 		t.Fatalf("payload path = %q", webhook.Path)
 	}
@@ -127,6 +135,62 @@ func TestReceiverDispatchesBareEvent(t *testing.T) {
 	got := environmentMap(jobs.Items[0].Spec.Template.Spec.Containers[0].Env)["GITHUB_EVENT"]
 	if got != "push" {
 		t.Fatalf("GITHUB_EVENT = %q", got)
+	}
+}
+
+// A pipeline that calls a command tree names it as a source, and the whole cost
+// of that on the receiver's side is one more mount and one more argument. The
+// order is the contract: the pipeline leads, because the bench runs the first
+// source carrying a run.
+func TestReceiverMountsNamedSourcesInOrder(t *testing.T) {
+	handler, client, pipelines := testReceiver(t, 1<<20)
+	configMap := pipelineConfigMap(
+		"secrets-build",
+		"example_inc/secrets.site",
+		"pull_request.synchronize",
+	)
+	configMap.Annotations[pipelineSourcesAnnotation] = "millwright, secrets-build ,toolbelt"
+	pipelines.upsert(configMap)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, signedRequest(t, "pull_request",
+		validPayload("Example_Inc/Secrets.Site", "synchronize"), testSecret))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := jobs.Items[0].Spec.Template.Spec
+	container := pod.Containers[0]
+	// The pipeline names itself among its sources; it is still listed once, and
+	// still first.
+	if got := strings.Join(container.Args, " "); got != "exec bench secrets-build millwright toolbelt" {
+		t.Fatalf("command line = %q", got)
+	}
+	for index, source := range []string{"secrets-build", "millwright", "toolbelt"} {
+		volume := fmt.Sprintf("source-%d", index)
+		if got := mountPath(container.VolumeMounts, volume); got != benchRoot+"/mnt/"+source {
+			t.Errorf("%s mounted at %q", source, got)
+		}
+		if got := configMapVolume(pod.Volumes, volume); got != source {
+			t.Errorf("%s backed by ConfigMap %q", source, got)
+		}
+	}
+}
+
+func TestPipelineCacheRejectsUnusableSourceName(t *testing.T) {
+	configMap := pipelineConfigMap(
+		"secrets-build",
+		"example_inc/secrets.site",
+		"push",
+	)
+	configMap.Annotations[pipelineSourcesAnnotation] = "Not A ConfigMap"
+
+	if _, err := pipelineFromConfigMap(configMap, "example_inc"); err == nil {
+		t.Fatal("a source name that cannot resolve to a ConfigMap was accepted")
 	}
 }
 
@@ -577,6 +641,31 @@ func pipelineConfigMap(name, repository, events string) *corev1.ConfigMap {
 			pipelineArchiveKey: []byte("tar bytes"),
 		},
 	}
+}
+
+func mountPath(mounts []corev1.VolumeMount, name string) string {
+	for _, mount := range mounts {
+		if mount.Name == name {
+			return mount.MountPath
+		}
+	}
+	return ""
+}
+
+func volumeNamed(volumes []corev1.Volume, name string) corev1.Volume {
+	for _, volume := range volumes {
+		if volume.Name == name {
+			return volume
+		}
+	}
+	return corev1.Volume{}
+}
+
+func configMapVolume(volumes []corev1.Volume, name string) string {
+	if volume := volumeNamed(volumes, name); volume.ConfigMap != nil {
+		return volume.ConfigMap.Name
+	}
+	return ""
 }
 
 func environmentMap(environment []corev1.EnvVar) map[string]string {

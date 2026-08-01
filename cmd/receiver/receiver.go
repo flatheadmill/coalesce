@@ -31,9 +31,15 @@ const (
 	pipelineRepositoryAnnotation = "coalesce.flatheadmill.com/repository"
 	pipelineEventsAnnotation     = "coalesce.flatheadmill.com/events"
 	pipelineImageAnnotation      = "coalesce.flatheadmill.com/image"
+	pipelineSourcesAnnotation    = "coalesce.flatheadmill.com/sources"
 	pipelineArchiveKey           = "pipeline.tar.gz"
 	webhookPayloadAnnotation     = "coalesce.flatheadmill.com/webhook-payload"
 	webhookPayloadPath           = "/run/webhook/payload.json"
+
+	// The bench lays out every source tree before the pipeline runs, so the
+	// receiver's whole contribution is mounting the archives where it looks and
+	// naming them in order. It knows nothing about what a source contains.
+	benchRoot = "/run/coalesce"
 )
 
 type receiverConfig struct {
@@ -67,6 +73,11 @@ type pipeline struct {
 	Repository string
 	Image      string
 	Events     map[string]struct{}
+	// Sources is the bench's argument list. The pipeline's own ConfigMap is
+	// always first because it is the one carrying `run`, and the annotation adds
+	// whatever command trees the pipeline calls. A pipeline that needs nothing
+	// but itself names no sources at all.
+	Sources []string
 }
 
 type pipelineCache struct {
@@ -185,13 +196,46 @@ func pipelineFromConfigMap(configMap *corev1.ConfigMap, organization string) (pi
 	if len(configMap.BinaryData[pipelineArchiveKey]) == 0 {
 		return pipeline{}, fmt.Errorf("binaryData key %s is required", pipelineArchiveKey)
 	}
+	sources, err := parseSources(configMap.Name,
+		configMap.Annotations[pipelineSourcesAnnotation])
+	if err != nil {
+		return pipeline{}, fmt.Errorf("annotation %s: %w",
+			pipelineSourcesAnnotation, err)
+	}
 
 	return pipeline{
 		Name:       configMap.Name,
 		Repository: repository,
 		Image:      image,
 		Events:     events,
+		Sources:    sources,
 	}, nil
+}
+
+// The pipeline leads its own source list because it holds the `run` the bench
+// looks for, and the bench takes the first runnable source it finds. A named
+// source is a ConfigMap in this namespace holding one archive; the receiver
+// never opens it, so a name that does not resolve is a Pod that will not start
+// rather than an error here.
+func parseSources(name, value string) ([]string, error) {
+	sources := []string{name}
+	seen := map[string]struct{}{name: {}}
+	for _, value := range strings.Split(value, ",") {
+		source := strings.TrimSpace(value)
+		if source == "" {
+			continue
+		}
+		if errs := validation.IsDNS1123Subdomain(source); len(errs) > 0 {
+			return nil, fmt.Errorf("%q is not a ConfigMap name: %s",
+				source, strings.Join(errs, "; "))
+		}
+		if _, duplicate := seen[source]; duplicate {
+			continue
+		}
+		seen[source] = struct{}{}
+		sources = append(sources, source)
+	}
+	return sources, nil
 }
 
 func parseEvents(value string) (map[string]struct{}, error) {
@@ -509,6 +553,53 @@ func (receiver *receiver) job(
 	backoffLimit := int32(0)
 	ttl := int32(3600)
 
+	// One mount per source, at the name the bench will be given. The volume is
+	// named by position because a ConfigMap name may carry dots and a volume
+	// name may not; nothing reads the volume name, while the mount path is the
+	// whole interface.
+	mounts := []corev1.VolumeMount{
+		{Name: "src", MountPath: benchRoot + "/src"},
+		{Name: "webhook", MountPath: "/run/webhook", ReadOnly: true},
+	}
+	volumes := []corev1.Volume{
+		{
+			Name: "src",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "webhook",
+			VolumeSource: corev1.VolumeSource{
+				DownwardAPI: &corev1.DownwardAPIVolumeSource{
+					Items: []corev1.DownwardAPIVolumeFile{{
+						Path: "payload.json",
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "metadata.annotations['" +
+								webhookPayloadAnnotation + "']",
+						},
+					}},
+				},
+			},
+		},
+	}
+	for index, source := range pipeline.Sources {
+		name := fmt.Sprintf("source-%d", index)
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      name,
+			MountPath: benchRoot + "/mnt/" + source,
+			ReadOnly:  true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: source},
+				},
+			},
+		})
+	}
+
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      slug,
@@ -547,12 +638,19 @@ func (receiver *receiver) job(
 						Name:            "pipeline",
 						Image:           pipeline.Image,
 						ImagePullPolicy: corev1.PullAlways,
-						Command:         []string{"/bin/sh", "-c"},
-						WorkingDir:      "/run/pipeline",
+						// The house shape: zsh -c and a command line you can
+						// read in the manifest. Source names are ConfigMap
+						// names, checked when the pipeline was cached, so the
+						// line cannot carry anything the shell would take as
+						// syntax.
+						//
+						// tini leads it because Kubernetes sends TERM to PID 1
+						// alone. Without it a run blocked in a curl or kubectl
+						// finishes that child before its trap runs, and a pod
+						// killed mid-step records nothing.
+						Command: []string{"tini", "-g", "--", "zsh", "-c"},
 						Args: []string{
-							"set -eu\n" +
-								"tar -xzf /run/coalesce/pipeline.tar.gz -C .\n" +
-								"exec ./run",
+							"exec bench " + strings.Join(pipeline.Sources, " "),
 						},
 						Env: []corev1.EnvVar{
 							{Name: "COALESCE_NAMESPACE", Value: receiver.config.Namespace},
@@ -563,59 +661,9 @@ func (receiver *receiver) job(
 							{Name: "GITHUB_EVENT", Value: event},
 							{Name: "GITHUB_WEBHOOK_PAYLOAD_FILE", Value: webhookPayloadPath},
 						},
-						VolumeMounts: []corev1.VolumeMount{
-							{
-								Name:      "archive",
-								MountPath: "/run/coalesce",
-								ReadOnly:  true,
-							},
-							{
-								Name:      "pipeline",
-								MountPath: "/run/pipeline",
-							},
-							{
-								Name:      "webhook",
-								MountPath: "/run/webhook",
-								ReadOnly:  true,
-							},
-						},
+						VolumeMounts: mounts,
 					}},
-					Volumes: []corev1.Volume{
-						{
-							Name: "archive",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: pipeline.Name,
-									},
-									Items: []corev1.KeyToPath{{
-										Key:  pipelineArchiveKey,
-										Path: pipelineArchiveKey,
-									}},
-								},
-							},
-						},
-						{
-							Name: "pipeline",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
-						{
-							Name: "webhook",
-							VolumeSource: corev1.VolumeSource{
-								DownwardAPI: &corev1.DownwardAPIVolumeSource{
-									Items: []corev1.DownwardAPIVolumeFile{{
-										Path: "payload.json",
-										FieldRef: &corev1.ObjectFieldSelector{
-											FieldPath: "metadata.annotations['" +
-												webhookPayloadAnnotation + "']",
-										},
-									}},
-								},
-							},
-						},
-					},
+					Volumes: volumes,
 				},
 			},
 		},
