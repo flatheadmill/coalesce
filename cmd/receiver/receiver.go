@@ -32,6 +32,7 @@ const (
 	pipelineEventsAnnotation     = "coalesce.flatheadmill.com/events"
 	pipelineImageAnnotation      = "coalesce.flatheadmill.com/image"
 	pipelineSourcesAnnotation    = "coalesce.flatheadmill.com/sources"
+	pipelineSecretsAnnotation    = "coalesce.flatheadmill.com/secrets"
 	webhookPayloadAnnotation     = "coalesce.flatheadmill.com/webhook-payload"
 	webhookPayloadPath           = "/run/webhook/payload.json"
 
@@ -110,6 +111,7 @@ type pipeline struct {
 	// depends on it. The annotation adds whatever libraries the pipeline
 	// calls; a pipeline that needs nothing but itself names no sources at all.
 	Sources []string
+	Secrets []string
 }
 
 type pipelineCache struct {
@@ -234,6 +236,11 @@ func pipelineFromConfigMap(configMap *corev1.ConfigMap, organization string) (pi
 		return pipeline{}, fmt.Errorf("annotation %s: %w",
 			pipelineSourcesAnnotation, err)
 	}
+	secrets, err := parseSecrets(configMap.Annotations[pipelineSecretsAnnotation])
+	if err != nil {
+		return pipeline{}, fmt.Errorf("annotation %s: %w",
+			pipelineSecretsAnnotation, err)
+	}
 
 	return pipeline{
 		Name:       configMap.Name,
@@ -241,6 +248,7 @@ func pipelineFromConfigMap(configMap *corev1.ConfigMap, organization string) (pi
 		Image:      image,
 		Events:     events,
 		Sources:    sources,
+		Secrets:    secrets,
 	}, nil
 }
 
@@ -250,24 +258,34 @@ func pipelineFromConfigMap(configMap *corev1.ConfigMap, organization string) (pi
 // namespace carrying ball.tar.gz; the receiver never opens it, so a name that
 // does not resolve is a Pod that will not start rather than an error here.
 func parseSources(name, value string) ([]string, error) {
-	sources := []string{name}
-	seen := map[string]struct{}{name: {}}
-	for _, value := range strings.Split(value, ",") {
-		source := strings.TrimSpace(value)
-		if source == "" {
-			continue
-		}
-		if errs := validation.IsDNS1123Subdomain(source); len(errs) > 0 {
-			return nil, fmt.Errorf("%q is not a ConfigMap name: %s",
-				source, strings.Join(errs, "; "))
-		}
-		if _, duplicate := seen[source]; duplicate {
-			continue
-		}
-		seen[source] = struct{}{}
-		sources = append(sources, source)
+	return parseResourceNames("ConfigMap", value, name)
+}
+
+func parseSecrets(value string) ([]string, error) {
+	return parseResourceNames("Secret", value)
+}
+
+func parseResourceNames(kind, value string, names ...string) ([]string, error) {
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		seen[name] = struct{}{}
 	}
-	return sources, nil
+	for _, value := range strings.Split(value, ",") {
+		name := strings.TrimSpace(value)
+		if name == "" {
+			continue
+		}
+		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+			return nil, fmt.Errorf("%q is not a %s name: %s",
+				name, kind, strings.Join(errs, "; "))
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names, nil
 }
 
 func parseEvents(value string) (map[string]struct{}, error) {
@@ -627,6 +645,26 @@ func (receiver *receiver) job(
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{Name: source},
+				},
+			},
+		})
+	}
+	secretMode := int32(0444)
+	for index, secret := range pipeline.Secrets {
+		name := fmt.Sprintf("secret-%d", index)
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      name,
+			MountPath: benchRoot + "/secrets/" + secret,
+			ReadOnly:  true,
+		})
+		// Kubelet may refresh this volume while a Job is running. A caller that
+		// needs one credential for the whole run must read the file once.
+		volumes = append(volumes, corev1.Volume{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  secret,
+					DefaultMode: &secretMode,
 				},
 			},
 		})

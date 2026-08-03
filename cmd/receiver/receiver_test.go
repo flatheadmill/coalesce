@@ -69,6 +69,9 @@ func TestReceiverDispatchesRawPayload(t *testing.T) {
 	if got := mountPath(container.VolumeMounts, "src"); got != benchRoot+"/src" {
 		t.Fatalf("source trees mounted at %q", got)
 	}
+	if got := mountPath(container.VolumeMounts, "secret-0"); got != "" {
+		t.Fatalf("undeclared Secret mounted at %q", got)
+	}
 
 	env := environmentMap(container.Env)
 	want := map[string]string{
@@ -196,6 +199,69 @@ func TestPipelineCacheRejectsUnusableSourceName(t *testing.T) {
 
 	if _, err := pipelineFromConfigMap(configMap, "example_inc"); err == nil {
 		t.Fatal("a source name that cannot resolve to a ConfigMap was accepted")
+	}
+}
+
+func TestReceiverMountsNamedSecretsInOrder(t *testing.T) {
+	handler, client, pipelines := testReceiver(t, 1<<20)
+	configMap := pipelineConfigMap(
+		"secrets-build",
+		"example_inc/secrets.site",
+		"pull_request.synchronize",
+	)
+	configMap.Annotations[pipelineSecretsAnnotation] =
+		"github-status, registry.credentials ,github-status"
+	pipelines.upsert(configMap)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, signedRequest(t, "pull_request",
+		validPayload("Example_Inc/Secrets.Site", "synchronize"), testSecret))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := jobs.Items[0].Spec.Template.Spec
+	container := pod.Containers[0]
+	for index, secret := range []string{"github-status", "registry.credentials"} {
+		name := fmt.Sprintf("secret-%d", index)
+		mount := volumeMountNamed(container.VolumeMounts, name)
+		if mount.MountPath != benchRoot+"/secrets/"+secret {
+			t.Errorf("%s mounted at %q", secret, mount.MountPath)
+		}
+		if !mount.ReadOnly {
+			t.Errorf("%s mount is writable", secret)
+		}
+		volume := volumeNamed(pod.Volumes, name)
+		if volume.Secret == nil || volume.Secret.SecretName != secret {
+			t.Errorf("%s backed by %+v", secret, volume.VolumeSource)
+			continue
+		}
+		if len(volume.Secret.Items) != 0 {
+			t.Errorf("%s selected keys %+v", secret, volume.Secret.Items)
+		}
+		if volume.Secret.Optional != nil {
+			t.Errorf("%s optional = %v", secret, *volume.Secret.Optional)
+		}
+		if volume.Secret.DefaultMode == nil || *volume.Secret.DefaultMode != 0444 {
+			t.Errorf("%s mode = %v", secret, volume.Secret.DefaultMode)
+		}
+	}
+}
+
+func TestPipelineCacheRejectsUnusableSecretName(t *testing.T) {
+	configMap := pipelineConfigMap(
+		"secrets-build",
+		"example_inc/secrets.site",
+		"push",
+	)
+	configMap.Annotations[pipelineSecretsAnnotation] = "Not A Secret"
+
+	if _, err := pipelineFromConfigMap(configMap, "example_inc"); err == nil {
+		t.Fatal("a Secret name that Kubernetes cannot resolve was accepted")
 	}
 }
 
@@ -649,12 +715,16 @@ func pipelineConfigMap(name, repository, events string) *corev1.ConfigMap {
 }
 
 func mountPath(mounts []corev1.VolumeMount, name string) string {
+	return volumeMountNamed(mounts, name).MountPath
+}
+
+func volumeMountNamed(mounts []corev1.VolumeMount, name string) corev1.VolumeMount {
 	for _, mount := range mounts {
 		if mount.Name == name {
-			return mount.MountPath
+			return mount
 		}
 	}
-	return ""
+	return corev1.VolumeMount{}
 }
 
 func volumeNamed(volumes []corev1.Volume, name string) corev1.Volume {
