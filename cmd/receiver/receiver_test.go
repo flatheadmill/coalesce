@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func TestReceiverDispatchesRawPayload(t *testing.T) {
 	}
 
 	job := jobs.Items[0]
-	if job.Name != "secrets-site-pull-request-synchronize-1754000000" {
+	if job.Name != "secrets-build-511-t0ab28" {
 		t.Fatalf("Job name = %q", job.Name)
 	}
 	if problems := validation.IsDNS1123Label(job.Name); len(problems) != 0 {
@@ -78,7 +79,7 @@ func TestReceiverDispatchesRawPayload(t *testing.T) {
 		"COALESCE_NAMESPACE":          "coalesce",
 		"COALESCE_PIPELINE":           "secrets-build",
 		"COALESCE_SOURCES":            "secrets-build",
-		"COALESCE_SLUG":               "secrets-site-pull-request-synchronize-1754000000",
+		"COALESCE_SLUG":               "secrets-build-511-t0ab28",
 		"COALESCE_URL":                "http://coalesce.coalesce.svc.cluster.local",
 		"GITHUB_DELIVERY":             "delivery-123",
 		"GITHUB_EVENT":                "pull_request.synchronize",
@@ -292,7 +293,11 @@ func TestReceiverDoesNotDeduplicate(t *testing.T) {
 	}
 }
 
-func TestReceiverSurfacesDuplicateClaim(t *testing.T) {
+// Two pipelines claiming one event both launch. The slug opens with each
+// pipeline's own name, so there is no shared Job name to fight over — the
+// old surfaced-collision behavior was an artifact of a slug minted once per
+// delivery, and it retired with that slug.
+func TestReceiverLaunchesEveryClaimingPipeline(t *testing.T) {
 	handler, client, pipelines := testReceiver(t, 1<<20)
 	pipelines.upsert(pipelineConfigMap(
 		"secrets-build-copy",
@@ -304,15 +309,22 @@ func TestReceiverSurfacesDuplicateClaim(t *testing.T) {
 	handler.ServeHTTP(response, signedRequest(t, "pull_request",
 		validPayload("Example_Inc/Secrets.Site", "synchronize"), testSecret))
 
-	if response.Code != http.StatusInternalServerError {
+	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
 	}
 	jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(jobs.Items) != 1 {
-		t.Fatalf("created %d Jobs, want one successful claim", len(jobs.Items))
+	if len(jobs.Items) != 2 {
+		t.Fatalf("created %d Jobs, want both claims", len(jobs.Items))
+	}
+	names := map[string]struct{}{}
+	for _, job := range jobs.Items {
+		names[job.Name] = struct{}{}
+	}
+	if len(names) != 2 {
+		t.Fatalf("claims shared a Job name: %v", names)
 	}
 }
 
@@ -631,35 +643,45 @@ func TestReceiverLogsBodyReadFailure(t *testing.T) {
 	}
 }
 
-func TestRunSlugIsStructuralAndBounded(t *testing.T) {
-	first := runSlug("owner/foo_bar", "pull_request.opened", testNow)
-	second := runSlug("owner/foo.bar", "pull_request.opened", testNow)
-	if first != second {
-		t.Fatalf("sanitization collision was engineered apart: %q != %q", first, second)
+// The slug opens with the pipeline's own name and carries the event's human
+// identity — a pull request number, or a pushed SHA shortened to seven — then
+// the epoch in base36. No derivation, no truncation, no budget arithmetic:
+// the 63-byte total is the pipeline author's lookout, enforced loudly by the
+// executor where the child-name arithmetic lives.
+func TestRunSlugCarriesNameIdentityAndEpoch(t *testing.T) {
+	epoch := strconv.FormatInt(testNow.Unix(), 36)
+
+	pr := runSlug("webster-build", webhookEnvelope{Number: 511}, testNow)
+	if pr != "webster-build-511-"+epoch {
+		t.Fatalf("pull request slug = %q", pr)
 	}
 
-	long := runSlug("owner/"+strings.Repeat("a", 100), "pull_request.synchronize", testNow)
-	if len(long) > 48 {
-		t.Fatalf("%q is %d characters", long, len(long))
+	push := runSlug("webster-zero", webhookEnvelope{
+		After: "AA427401a7f535ce2a69b51e851f5e5f1e1990d7",
+	}, testNow)
+	if push != "webster-zero-aa42740-"+epoch {
+		t.Fatalf("push slug = %q", push)
 	}
-	if problems := validation.IsDNS1123Label(long); len(problems) != 0 {
-		t.Fatalf("%q is invalid: %v", long, problems)
+
+	bare := runSlug("webster-close", webhookEnvelope{}, testNow)
+	if bare != "webster-close-"+epoch {
+		t.Fatalf("bare slug = %q", bare)
 	}
-	wantSuffix := fmt.Sprintf("-pull-request-synchronize-%d", testNow.Unix())
-	if !strings.HasSuffix(long, wantSuffix) {
-		t.Fatalf("qualified event or epoch was truncated in %q", long)
-	}
-	childName := long + "-ffffffff-build"
-	if len(childName) > 63 {
-		t.Fatalf("reserved child name %q is %d characters", childName, len(childName))
+
+	for _, slug := range []string{pr, push, bare} {
+		if problems := validation.IsDNS1123Label(slug); len(problems) != 0 {
+			t.Fatalf("%q is invalid: %v", slug, problems)
+		}
 	}
 }
 
-func TestRunSlugSeparatesQualifiedEvents(t *testing.T) {
-	opened := runSlug("owner/repository", "pull_request.opened", testNow)
-	labeled := runSlug("owner/repository", "pull_request.labeled", testNow)
-	if opened == labeled {
-		t.Fatalf("qualified events produced the same slug %q", opened)
+// Two pipelines claiming one event mint two names, because the slug opens
+// with the pipeline's name — the old shared-slug collision cannot happen.
+func TestRunSlugSeparatesPipelines(t *testing.T) {
+	build := runSlug("example-build", webhookEnvelope{Number: 7}, testNow)
+	scan := runSlug("example-scan", webhookEnvelope{Number: 7}, testNow)
+	if build == scan {
+		t.Fatalf("pipelines produced the same slug %q", build)
 	}
 }
 
@@ -788,6 +810,7 @@ func signature(secret, body []byte) string {
 func validPayload(repository, action string) []byte {
 	return []byte(fmt.Sprintf(`{
 		"action": %q,
+		"number": 511,
 		"repository": {"full_name": %q},
 		"contributor_input": "$(touch /tmp/not-code)"
 	}`, action, repository))

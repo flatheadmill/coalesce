@@ -1,17 +1,23 @@
 Developing Coalesce
 
-Coalesce has two halves: a Zsh executor that orchestrates pipelines on
-Kubernetes, and a Go server that records metadata to PostgreSQL and streams
-events to the UI via WebSocket. The executor runs on the Mac. The server runs
-inside OrbStack's Kubernetes cluster. PostgreSQL runs as a Docker container on
-the Mac, reachable from pods via host.orb.internal.
+Coalesce has two development loops and only one of them is fast everywhere.
+Pipelines change at apply speed — edit the Zsh, re-run, seconds — and that
+loop works the same on any cluster. The substrate is the other loop: the
+receiver's Go, the executor's Zsh, the server. This file is the doorway to the
+substrate's own fast loop — a Coalesce deployment for OrbStack's single-node
+Kubernetes, on the Mac where the substrate is actually edited.
+
+The local environment is the same programs as production with different
+environment. There is no dev mode anywhere; the difference lives entirely in
+manifests/local/, which is what keeps the local world honest about the real
+one.
 
 ---
 
 Prerequisites
 
-OrbStack provides Docker and Kubernetes in one install. The Kubernetes cluster
-must be running:
+OrbStack provides Docker and Kubernetes in one install. The Kubernetes
+cluster must be running:
 
     orb start k8s
 
@@ -19,166 +25,158 @@ Verify:
 
     kubectl --context orbstack cluster-info
 
-OrbStack makes ClusterIP services, pod IPs, and cluster DNS directly
-accessible from the Mac without port-forward. This is what makes the
-development loop practical.
-
 ---
 
-kubectl Context
+kubectl Context — read this one
 
-OrbStack adds its cluster as the "orbstack" context. Your default context may
-point elsewhere (production, for instance). Always use --context orbstack for
-local development, or switch your default:
+Your Mac's kubeconfig almost certainly defaults to a real cluster. On the
+machines this file was written for, the current context is production. Every
+command below carries --context orbstack, and the flag is not decoration: a
+bare `kubectl delete namespace coalesce` is the difference between resetting
+a sandbox and deleting production's namespace, one omitted word apart.
 
-    kubectl config use-context orbstack
-
-To check where kubectl is currently pointed:
+To see where a bare kubectl currently points:
 
     kubectl config current-context
 
----
+The executor calls kubectl without a context flag, so Mac-side pipeline runs
+need a guarded environment. Generate a kubeconfig that can only see OrbStack
+and export it for the run (shown below under Running a Pipeline):
 
-PostgreSQL
-
-PostgreSQL runs as a Docker container. If it doesn't exist yet:
-
-    docker run -d --name coalesce-pg \
-        -e POSTGRES_USER=postgres \
-        -e POSTGRES_PASSWORD=postgres \
-        -e POSTGRES_DB=coalesce \
-        -p 5432:5432 \
-        postgres:17
-
-If it exists but is stopped: docker start coalesce-pg
-
-Data persists across container restarts. The Go server's defaults (user
-postgres, password postgres, database coalesce, host localhost, port 5432, SSL
-disabled) match this container when running outside the cluster. Inside the
-cluster, the server reaches PostgreSQL at host.orb.internal:5432 via the
-DB_HOST environment variable in the deployment manifest.
+    kubectl config view --minify --flatten --context orbstack > /tmp/orbstack.kubeconfig
 
 ---
 
-Building the Go Server
+The Cluster Is Shared
 
-From the project root:
+The standing OrbStack cluster carries other tenants (penpot and friends, in
+default). The local environment lives strictly in its own coalesce namespace.
+Never `orb delete k8s` — that costs a colleague's running furniture. The reset
+that is yours to run is the namespace, described at the bottom of this file.
+
+---
+
+Deploying
+
+Build the server image — OrbStack makes locally built images visible to its
+cluster, no registry, no push, no pull secret:
 
     docker build -t coalesce-web .
 
-This produces a multi-stage image: golang:1.24-alpine builds the binary,
-alpine runs it. The final image is roughly 56MB.
+Apply the local manifests — namespace, PostgreSQL, server, in one pass:
 
-OrbStack makes locally-built Docker images available to its Kubernetes cluster
-without pushing to a registry. The deployment manifest uses imagePullPolicy:
-Never to ensure Kubernetes uses the local image.
+    kubectl --context orbstack apply -f manifests/local/
 
----
+This creates the coalesce namespace; a PostgreSQL Deployment with its data on
+a PVC; and the server with its ServiceAccount, namespaced RBAC for pod log
+access, a PVC for log storage, and a Service named coalesce. Both Deployments
+carry strategy Recreate on purpose — on one node, ReadWriteOnce guards
+nothing, and a rolling update would run two servers (stale-looking UI at
+exactly the wrong moment) or two postmasters (a crash-looping database).
 
-Deploying to the Cluster
+The server pod may restart once or twice while PostgreSQL comes up: it exits
+fatally when the database is unreachable, and Kubernetes retries until the
+readiness order sorts itself out. That is the intended arrangement, not a bug.
 
-Apply the manifests:
+Verify from the Mac — OrbStack resolves cluster DNS directly, so this needs
+no port-forward:
 
-    kubectl --context orbstack apply -f manifests/server.yaml
+    curl http://coalesce.coalesce.svc.cluster.local/health
 
-This creates a ServiceAccount, RBAC Role (for pod log access), RoleBinding,
-Deployment, and Service. The server starts, connects to PostgreSQL via
-host.orb.internal, runs migrations, initializes Stow with a local backend,
-and loads in-cluster Kubernetes config.
+The same address works from curl, the browser, and any process on the Mac.
+The UI prototype is served at the root:
 
-Verify:
-
-    kubectl --context orbstack get pods -l app=coalesce-web
-    kubectl --context orbstack logs -l app=coalesce-web
-    curl coalesce-web.default.svc.cluster.local/health
-
-The service is a ClusterIP on port 80, forwarding to the pod's 8080. OrbStack
-makes cluster DNS reachable from the Mac, so the curl above works without
-port-forward.
+    http://coalesce.coalesce.svc.cluster.local/?namespace=coalesce&slug=hello-1
 
 ---
 
-OrbStack Networking
+The Substrate Loop
 
-OrbStack's networking is what makes the development loop practical. From the
-Mac you can directly reach pod IPs, ClusterIP services, and cluster DNS names.
-No kubectl port-forward, no tunnels, no special configuration. The Mac's DNS
-resolver knows about the cluster.
-
-This means the browser works too. Open the UI at:
-
-    http://coalesce-web.default.svc.cluster.local/?slug=test-wire
-
-The same URL works from curl, from the browser, from any process on the Mac.
-The server serves run.html at / so the API calls from JavaScript use relative
-URLs that route to the same server.
-
-Containers on the Mac reach pods via host.orb.internal. Pods reach the Mac
-(for PostgreSQL) via host.orb.internal. The executor runs on the Mac and
-creates Jobs via kubectl. Everything talks to everything without port mapping.
-
-For containers outside Kubernetes, OrbStack assigns domain names at
-container-name.orb.local with automatic HTTPS via the macOS keychain.
-
----
-
-Development Loop
-
-After editing Go code, the cycle is:
+After editing server Go code:
 
     docker build -t coalesce-web .
-    kubectl --context orbstack rollout restart deployment/coalesce-web
+    kubectl --context orbstack rollout restart deployment/coalesce-web -n coalesce
 
-The rollout restart picks up the new image because imagePullPolicy is Never
-and the tag is the same. Kubernetes replaces the old pod with a new one.
+Recreate replaces the pod with the new image (imagePullPolicy Never, same
+tag). Check it came up:
 
-Check it came up:
+    kubectl --context orbstack logs -n coalesce deployment/coalesce-web --tail=10
 
-    kubectl --context orbstack logs -l app=coalesce-web --tail=10
+Logs stored before the rebuild are still retrievable after it — they live on
+the coalesce-logs PVC, not in the pod — so the database's container rows and
+the log store keep agreeing across rebuilds.
 
 ---
 
 Running a Pipeline
 
-The executor runs on the Mac and creates Jobs in the OrbStack cluster:
+The executor runs on the Mac and creates Jobs in the cluster. Three defaults
+in the code all whisper "default" — the executor's namespace, its server URL,
+and the server's watch namespace. The manifests override the server's; the
+invocation must override the executor's two, and guard kubectl:
 
-    ./bin/coalesce -s test-one run test/one.coalesce.zsh
-    ./bin/coalesce -s test-fanout run test/fanout.coalesce.zsh
+    kubectl config view --minify --flatten --context orbstack > /tmp/orbstack.kubeconfig
+    export KUBECONFIG=/tmp/orbstack.kubeconfig
+    export COALESCE_URL=http://coalesce.coalesce.svc.cluster.local
+    ./bin/coalesce run -s hello-1 -N coalesce test/one.coalesce.zsh
 
-The -s flag sets the slug and goes before the subcommand. Jobs are labeled
-with coalesce.flatheadmill.com/slug and coalesce.flatheadmill.com/job for
-identification.
+The -s flag is the slug — the run's identity. Re-running with the same slug
+resumes: completed jobs are skipped. A fresh slug is a fresh run.
+
+Verify the run recorded, and that nothing leaked into default:
+
+    curl http://coalesce.coalesce.svc.cluster.local/api/coalesce/runs
+    kubectl --context orbstack get jobs -n default
+
+The first command shows the run row; the second must stay empty. If the row
+turned up under /api/default/runs instead, or Jobs appeared in default, an
+override was missed.
+
+Retrieve a harvested log (the server's pod watcher collects logs from
+terminated pods into the log store):
+
+    curl http://coalesce.coalesce.svc.cluster.local/api/coalesce/logs/hello-1/coalesce.printer/printer
 
 ---
 
 Log Tailing
 
-The server tails logs from running pods via the Kubernetes API. Start tailing
-a job's pod:
+The server tails logs from running pods via the Kubernetes API:
 
-    curl -X POST coalesce-web.default.svc.cluster.local/api/default/tail/{slug}/{job}
+    curl -X POST http://coalesce.coalesce.svc.cluster.local/api/coalesce/tail/{slug}/{job}
 
 The server finds the pod by label selector, waits for it to leave Pending,
-then streams log lines through the EventHub as log_line events. WebSocket
-subscribers on /events/{namespace}/{slug} receive these in real time.
+and streams lines through the EventHub as log_line events. WebSocket
+subscribers on /events/coalesce/{slug} receive them in real time.
 
 ---
 
 Log Storage
 
-Stow abstracts log storage. For local development it writes to
-/tmp/coalesce-logs inside the pod. For production, set STOW_KIND=google and
-STOW_BUCKET to a GCS bucket name.
+Stow abstracts log storage. The local manifests point it at the coalesce-logs
+PVC via STOW_KIND=local and STOW_PATH — do not remove those lines: without
+them the code quietly defaults to /tmp inside the pod, every rebuild discards
+the logs, and the first log click after a rebuild returns a storage error
+that looks like a UI bug and is not one. Production sets STOW_KIND=google and
+STOW_BUCKET instead.
 
 ---
 
-Manifests
+Resetting
 
-All Kubernetes manifests live in manifests/:
+Dev data is disposable. The reset is the namespace, and only the namespace:
 
-    manifests/crd.yaml              Coalesce CRD
-    manifests/example-pipeline.yaml Example pipeline resources
-    manifests/server.yaml           Server deployment (SA, RBAC, Deployment, Service)
+    kubectl --context orbstack delete namespace coalesce
+    kubectl --context orbstack apply -f manifests/local/
+
+Then check the reclaim chain held — PV cleanup is the local-path provisioner
+scheduling a helper pod, not the API server deleting data, and if the
+provisioner hiccups a Released PV lingers with its data intact, cluster-scoped
+and invisible to the namespace reset:
+
+    kubectl --context orbstack get pv
+
+Nothing in Released means the chain held.
 
 ---
 
@@ -188,30 +186,32 @@ Layout
     share/coalesce/commands/        Executor commands (run/command.zsh is the event loop)
     cmd/web/main.go                 Go server
     cmd/web/migrations/             Database schema
+    cmd/receiver/                   Webhook receiver
     run.html                        UI prototype (Cytoscape + xterm)
     test/                           Pipeline test definitions
-    manifests/                      Kubernetes manifests
-    Dockerfile                      Multi-stage build for the Go server
+    manifests/local/                The local environment (this file's subject)
+    manifests/                      Older manifests, kept beside
+    Dockerfile                      Server image
+    Dockerfile.receiver             Receiver image
+    Dockerfile.runner               Runner image
 
 ---
 
 Troubleshooting
 
-If the pod fails to start, check that PostgreSQL is running and publishing
-port 5432:
+Server pod crash-looping: check PostgreSQL first —
 
-    docker ps --filter name=coalesce-pg
+    kubectl --context orbstack get pods -n coalesce
+    kubectl --context orbstack logs -n coalesce deployment/coalesce-web
 
-If the pod can't reach PostgreSQL, verify host.orb.internal resolves from
-inside the cluster:
-
-    kubectl --context orbstack run -it --rm debug --image=alpine -- sh -c 'apk add curl && curl -v host.orb.internal:5432'
-
-If the image isn't found, verify it exists locally:
+Image not found (ErrImageNeverPull): the local build is missing —
 
     docker images coalesce-web
 
-If kubectl points at the wrong cluster:
+Run recorded under the wrong namespace: see Running a Pipeline; an override
+was missed. The row lands where the executor's curls said, not where the Jobs
+ran.
+
+kubectl pointed somewhere unexpected:
 
     kubectl config current-context
-    kubectl config use-context orbstack

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -91,9 +92,15 @@ type receiver struct {
 
 // webhookEnvelope is deliberately smaller than any GitHub event. The receiver
 // reads only enough of the signed document to find its dispatch rules; ./run
-// owns every interpretation of the payload after that.
+// owns every interpretation of the payload after that. Number and After are
+// read as data for the run's name — the pull request number is the human
+// identity of a PR event and the pushed SHA of a push — the same class of
+// reading as Action for dispatch, not a step toward interpreting payloads.
 type webhookEnvelope struct {
-	Action     string `json:"action"`
+	Action string `json:"action"`
+	Number int    `json:"number"`
+	After  string `json:"after"`
+
 	Repository struct {
 		FullName string `json:"full_name"`
 	} `json:"repository"`
@@ -495,10 +502,13 @@ func (receiver *receiver) ServeHTTP(w http.ResponseWriter, request *http.Request
 		return
 	}
 
-	slug := runSlug(repository, qualifiedEvent, receiver.now())
+	// The slug is minted per pipeline, not per delivery: it opens with the
+	// pipeline's own name, so two pipelines claiming one event can never
+	// fight over one Job name.
 	var created []string
 	var failed bool
 	for _, pipeline := range pipelines {
+		slug := runSlug(pipeline.Name, envelope, receiver.now())
 		job := receiver.job(pipeline, slug, qualifiedEvent, delivery, body)
 		ctx, cancel := context.WithTimeout(request.Context(), receiver.config.APITimeout)
 		_, err := receiver.jobs.Create(ctx, job, metav1.CreateOptions{})
@@ -740,29 +750,24 @@ func (receiver *receiver) job(
 // A slug declares what counts as the same work. CI builds choose a new identity
 // for every invocation; an expensive resumable pipeline can instead choose a
 // stable domain identity when it calls Coalesce itself.
-func runSlug(repository, event string, at time.Time) string {
-	_, name, err := splitRepository(repository)
-	if err != nil {
-		panic(err)
+//
+// The slug spends its characters on what an operator scans for in a pod
+// listing: the pipeline's own name — the author's chosen word from the
+// descriptor, no derivation here and no pattern language ever — then the
+// event's human identity, a pull request number or a pushed SHA shortened to
+// seven, then the same epoch as always, spelled in base36 for a smaller
+// column. The executor appends its checksum and step name, and the 63-byte
+// total is the pipeline author's lookout: name a step too long and the
+// executor refuses the create, loudly, where the arithmetic lives.
+func runSlug(name string, envelope webhookEnvelope, at time.Time) string {
+	slug := name
+	if envelope.Number > 0 {
+		slug += fmt.Sprintf("-%d", envelope.Number)
+	} else if after := strings.ToLower(envelope.After); len(after) >= 7 &&
+		validRepositoryPart(after) {
+		slug += "-" + after[:7]
 	}
-	epoch := fmt.Sprintf("-%d", at.Unix())
-	qualifiedEvent := sanitizeDNSLabel(event)
-	// This receiver currently launches one step named build. Its executor Job
-	// adds "-" + eight CRC32 hex digits + "-build" to this slug, so the slug is
-	// not the last derived Kubernetes name and must leave that concrete room.
-	// A future pipeline with a longer leaf is rejected where the executor knows
-	// the actual name rather than making every repository pay for a guessed cap.
-	const buildJobSuffixBudget = len("-ffffffff-build")
-	maxSlug := 63 - buildJobSuffixBudget
-	nameBudget := maxSlug - len(epoch) - len(qualifiedEvent) - 1
-	if nameBudget < 1 {
-		panic(fmt.Sprintf("qualified event %q leaves no room for a repository slug", event))
-	}
-	visibleName := sanitizeDNSLabel(name)
-	if len(visibleName) > nameBudget {
-		visibleName = strings.Trim(visibleName[:nameBudget], "-")
-	}
-	slug := visibleName + "-" + qualifiedEvent + epoch
+	slug += "-" + strconv.FormatInt(at.Unix(), 36)
 	if problems := validation.IsDNS1123Label(slug); len(problems) != 0 {
 		panic(fmt.Sprintf("generated invalid slug %q: %s",
 			slug, strings.Join(problems, ", ")))

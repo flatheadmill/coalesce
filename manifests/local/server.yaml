@@ -1,0 +1,133 @@
+# The Go server, deployed small: the same program as production with
+# different environment — the difference lives entirely in this manifest,
+# which is what keeps the local world honest about the real one.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coalesce-web
+  namespace: coalesce
+---
+# Pod log access for live tailing and the completion harvester. Namespaced
+# Role and RoleBinding only — a ClusterRole would survive the namespace
+# reset by construction.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coalesce-web
+  namespace: coalesce
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coalesce-web
+  namespace: coalesce
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coalesce-web
+subjects:
+- kind: ServiceAccount
+  name: coalesce-web
+  namespace: coalesce
+---
+# The log store. One manifest line the code's defaults would quietly skip:
+# Stow left alone falls back to /tmp inside the server pod, and every server
+# rebuild would discard the logs while PostgreSQL kept container rows pointing
+# at files that no longer exist. The PVC keeps the row and the log agreeing
+# across rebuilds — the cubbyhole's whole promise, kept locally.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: coalesce-logs
+  namespace: coalesce
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+# strategy Recreate: ReadWriteOnce guards a node, not a pod, and this cluster
+# is one node — a rolling update runs two servers against one log volume and
+# splits the EventHub, so the UI looks stale at exactly the moment a substrate
+# developer is judging a fresh rebuild. Determinism about which server you are
+# talking to is worth more in a dev loop than zero-downtime nobody asked for.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coalesce-web
+  namespace: coalesce
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: coalesce-web
+  template:
+    metadata:
+      labels:
+        app: coalesce-web
+    spec:
+      serviceAccountName: coalesce-web
+      containers:
+      - name: coalesce-web
+        # A local tag the cluster already sees: docker build makes it visible
+        # to OrbStack's Kubernetes without a registry, and Never means it is
+        # an error to look for one.
+        image: coalesce-web
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DB_HOST
+          value: coalesce-postgres
+        # Three code defaults whisper "default"; this is the server's
+        # override. The executor carries its own two: -N coalesce and
+        # COALESCE_URL, threaded by whoever invokes it.
+        - name: WATCH_NAMESPACE
+          value: coalesce
+        - name: STOW_KIND
+          value: local
+        - name: STOW_PATH
+          value: /var/lib/coalesce/logs
+        volumeMounts:
+        - name: logs
+          mountPath: /var/lib/coalesce/logs
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 5
+      volumes:
+      - name: logs
+        persistentVolumeClaim:
+          claimName: coalesce-logs
+---
+# Named "coalesce" so the address reads as the executor's COALESCE_URL does:
+# http://coalesce.<namespace>.svc.cluster.local — here, coalesce.coalesce.
+apiVersion: v1
+kind: Service
+metadata:
+  name: coalesce
+  namespace: coalesce
+spec:
+  selector:
+    app: coalesce-web
+  ports:
+  - port: 80
+    targetPort: 8080
