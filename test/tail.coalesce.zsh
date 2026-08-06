@@ -1,3 +1,3 @@
 function {
-    step -n ticker -- alpine -- sh -c 'for n in $(seq 1 120); do echo "tick $n"; sleep 1; done'
+    step -n ticker -- pod alpine -- sh -c 'for n in $(seq 1 120); do echo "tick $n"; sleep 1; done'
 }

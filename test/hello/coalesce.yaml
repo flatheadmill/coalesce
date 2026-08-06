@@ -1,9 +1,80 @@
-name: hello
-namespace: coalesce
-labels:
-  "coalesce.flatheadmill.com/pipeline": ""
-annotations:
-  "coalesce.flatheadmill.com/repository": example/coalesce-hello
-  "coalesce.flatheadmill.com/events": pull_request.opened
-  "coalesce.flatheadmill.com/image": harbor.example.org/example/coalesce-runner:latest
-  "coalesce.flatheadmill.com/sources": library
+# The descriptor is a typed document: metadata becomes the ConfigMap's
+# verbatim, and spec.template is the pod the receiver wraps in a Job — image,
+# pull policy, mounts, layout program, all authored here where the pipeline
+# can read its own arrangements. The receiver stamps the slug label and the
+# payload, event, and delivery annotations; everything else on the pod is
+# this document's word.
+apiVersion: coalesce.flatheadmill.com/v1alpha1
+kind: Coalesce
+metadata:
+  name: hello
+  namespace: coalesce
+  labels:
+    "coalesce.flatheadmill.com/pipeline": ""
+  annotations:
+    "coalesce.flatheadmill.com/repository": amalgamated-widgets/hello-widget
+    "coalesce.flatheadmill.com/events": pull_request.opened
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: pipeline
+        # The local dispatch image: zsh, tini, zshctl, nothing else. A local
+        # tag OrbStack's cluster already sees — IfNotPresent because there is
+        # nothing to pull from anywhere.
+        image: coalesce-dispatch
+        imagePullPolicy: IfNotPresent
+        # tini leads because Kubernetes sends TERM to PID 1 alone; the whole
+        # program rides in args, where the manifest shows it. The layout is
+        # authored content now: unpack each mounted source into the bench,
+        # step into the pipeline's own tree, hand over to its run.
+        command: ["tini", "-g", "--", "zsh", "-c"]
+        args:
+        - |
+          setopt errexit
+          for source in hello library; do
+              mkdir -p /run/coalesce/src/$source
+              tar -x -z -f /run/coalesce/mnt/$source/ball.tar.gz -C /run/coalesce/src/$source
+          done
+          cd /run/coalesce/src/hello
+          exec ./run
+        # The webhook's facts arrive by fieldRef from the pod annotations the
+        # receiver stamps: the signed body as a file, the event and delivery
+        # as environment.
+        env:
+        - name: GITHUB_EVENT
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['coalesce.flatheadmill.com/event']
+        - name: GITHUB_DELIVERY
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['coalesce.flatheadmill.com/delivery']
+        volumeMounts:
+        - name: src
+          mountPath: /run/coalesce/src
+        - name: hello
+          mountPath: /run/coalesce/mnt/hello
+          readOnly: true
+        - name: library
+          mountPath: /run/coalesce/mnt/library
+          readOnly: true
+        - name: webhook
+          mountPath: /run/webhook
+          readOnly: true
+      volumes:
+      - name: src
+        emptyDir: {}
+      - name: hello
+        configMap:
+          name: hello
+      - name: library
+        configMap:
+          name: library
+      - name: webhook
+        downwardAPI:
+          items:
+          - path: payload.json
+            fieldRef:
+              fieldPath: metadata.annotations['coalesce.flatheadmill.com/webhook-payload']

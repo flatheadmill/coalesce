@@ -1,2 +1,8 @@
-name: library
-namespace: coalesce
+# A library is the typed document with metadata only: no spec.template, so
+# the renderer emits no template.yaml and the receiver never claims it. It is
+# a mount for pipelines that name it, nothing more.
+apiVersion: coalesce.flatheadmill.com/v1alpha1
+kind: Coalesce
+metadata:
+  name: library
+  namespace: coalesce
