@@ -5,16 +5,16 @@ function :args:make {
     eval "$(args -bx h,help -- "$@")"
 }
 
-# The descriptor is the ConfigMap's metadata, verbatim. Whatever it names —
-# labels, annotations, anything Kubernetes accepts there — arrives untouched, so
-# this command never has to learn what a pipeline label means. The descriptor
-# rides inside the archive too, which costs nothing and leaves the artifact able
-# to describe itself. A directory with a claim label and a run is a pipeline; a
-# directory with neither is a library; this command renders both and cannot
-# tell them apart, which is the point.
+# The descriptor's metadata becomes the ConfigMap's metadata verbatim. Whatever
+# it names — labels, annotations, anything Kubernetes accepts there — arrives
+# untouched, so this command never has to learn what a pipeline label means.
+# A descriptor with spec.template carries that pod template as data; one without
+# it is a library. That is a structural distinction only, not an interpretation
+# of what either artifact does. The descriptor rides inside the archive too,
+# which costs nothing and leaves the artifact able to describe itself.
 #
 # The key is ball.tar.gz for every source, pipeline or library. This is the one
-# renderer and it stamps the one name the Job's layout script insists on — the
+# renderer and it stamps the one name a pod template can mount and unpack — the
 # loop is closed, so there is no second producer to accommodate.
 #
 # binaryData is printed rather than rendered, because a YAML writer is entitled
@@ -35,7 +35,12 @@ function :execute:make {
         print -r -- 'apiVersion: v1'
         print -r -- 'kind: ConfigMap'
         print -r -- 'metadata:'
-        gojq --yaml-input --yaml-output '.' < $file/coalesce.yaml | sed 's/^/  /'
+        gojq --yaml-input --yaml-output '.metadata' < $file/coalesce.yaml | sed 's/^/  /'
+        if gojq --yaml-input -e '.spec.template != null' < $file/coalesce.yaml > /dev/null; then
+            print -r -- 'data:'
+            print -r -- '  template.yaml: |'
+            gojq --yaml-input --yaml-output '.spec.template' < $file/coalesce.yaml | sed 's/^/    /'
+        fi
         print -r -- 'binaryData:'
         print -nr -- '  ball.tar.gz: '
         (

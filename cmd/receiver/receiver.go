@@ -21,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/yaml"
 	batchclient "k8s.io/client-go/kubernetes/typed/batch/v1"
 	kcache "k8s.io/client-go/tools/cache"
 )
@@ -31,54 +32,20 @@ const (
 	pipelineLabel                = "coalesce.flatheadmill.com/pipeline"
 	pipelineRepositoryAnnotation = "coalesce.flatheadmill.com/repository"
 	pipelineEventsAnnotation     = "coalesce.flatheadmill.com/events"
-	pipelineImageAnnotation      = "coalesce.flatheadmill.com/image"
-	pipelineSourcesAnnotation    = "coalesce.flatheadmill.com/sources"
-	pipelineSecretsAnnotation    = "coalesce.flatheadmill.com/secrets"
 	webhookPayloadAnnotation     = "coalesce.flatheadmill.com/webhook-payload"
-	webhookPayloadPath           = "/run/webhook/payload.json"
+	templateKey                  = "template.yaml"
 
 	// Every source carries exactly one archive and it is named ball.tar.gz,
 	// because coalesce make is the one renderer and stamps the one name. The
-	// loop is closed — one producer, one consumer, both in this house — so the
-	// layout below insists on the name rather than globbing for whatever might
-	// be there. A hand-rolled ConfigMap with a different key fails loudly at
-	// tar with the missing path in the message, and the answer to "it needs a
-	// specific name" is: yes, and? Use coalesce make.
+	// receiver checks only that a claimed pipeline carries its own artifact;
+	// the pod template owns how that artifact and any libraries are laid out.
 	archiveKey = "ball.tar.gz"
-
-	benchRoot = "/run/coalesce"
 )
-
-// The layout program is a constant, identical in every Job the receiver has
-// ever created, and the manifest shows all of it — no entry point, no helper
-// baked into an image, nothing running that kubectl get job -o yaml does not
-// display. The per-Job variance rides in the environment: COALESCE_SOURCES is
-// the list to lay out, COALESCE_PIPELINE the tree whose run starts. Data
-// never enters program text, so there is nothing to escape and no injection
-// class to argue about — the environment cannot become syntax no matter what
-// it contains. ${=COALESCE_SOURCES} is Zsh's explicit word split, visibly
-// overriding its refusal to split unquoted parameters.
-//
-// The only tools the script needs are tini, zsh, tar — furniture present in
-// every image this house has ever built — so the receiver and the runner
-// image may deploy in any order.
-// The loop body is indented with tabs because this is a Go file and the house
-// checks Go files for space indentation, string literal or not. Zsh does not
-// care, and the manifest reads the same.
-const layoutScript = `setopt errexit
-typeset name
-for name in ${=COALESCE_SOURCES}; do
-	mkdir -p ` + benchRoot + `/src/$name
-	tar -xzf ` + benchRoot + `/mnt/$name/` + archiveKey + ` -C ` + benchRoot + `/src/$name
-done
-cd ` + benchRoot + `/src/$COALESCE_PIPELINE
-exec ./run`
 
 type receiverConfig struct {
 	Secret       []byte
 	Organization string
 	Namespace    string
-	CoalesceURL  string
 	MaxBodyBytes int64
 	APITimeout   time.Duration
 }
@@ -109,16 +76,8 @@ type webhookEnvelope struct {
 type pipeline struct {
 	Name       string
 	Repository string
-	Image      string
 	Events     map[string]struct{}
-	// Sources is the layout list. The script unpacks every name in it and then
-	// cds into COALESCE_PIPELINE, which is carried separately, so the order
-	// here decides nothing — the pipeline is listed first because a list that
-	// opens with the thing being run reads correctly, not because anything
-	// depends on it. The annotation adds whatever libraries the pipeline
-	// calls; a pipeline that needs nothing but itself names no sources at all.
-	Sources []string
-	Secrets []string
+	Template   corev1.PodTemplateSpec
 }
 
 type pipelineCache struct {
@@ -225,10 +184,6 @@ func pipelineFromConfigMap(configMap *corev1.ConfigMap, organization string) (pi
 			owner, organization)
 	}
 
-	image := strings.TrimSpace(configMap.Annotations[pipelineImageAnnotation])
-	if image == "" {
-		return pipeline{}, fmt.Errorf("annotation %s is required", pipelineImageAnnotation)
-	}
 	events, err := parseEvents(configMap.Annotations[pipelineEventsAnnotation])
 	if err != nil {
 		return pipeline{}, fmt.Errorf("annotation %s: %w",
@@ -237,62 +192,21 @@ func pipelineFromConfigMap(configMap *corev1.ConfigMap, organization string) (pi
 	if len(configMap.BinaryData[archiveKey]) == 0 {
 		return pipeline{}, fmt.Errorf("binaryData key %s is required", archiveKey)
 	}
-	sources, err := parseSources(configMap.Name,
-		configMap.Annotations[pipelineSourcesAnnotation])
-	if err != nil {
-		return pipeline{}, fmt.Errorf("annotation %s: %w",
-			pipelineSourcesAnnotation, err)
+	templateYAML := configMap.Data[templateKey]
+	if strings.TrimSpace(templateYAML) == "" {
+		return pipeline{}, fmt.Errorf("data key %s is required", templateKey)
 	}
-	secrets, err := parseSecrets(configMap.Annotations[pipelineSecretsAnnotation])
-	if err != nil {
-		return pipeline{}, fmt.Errorf("annotation %s: %w",
-			pipelineSecretsAnnotation, err)
+	var template corev1.PodTemplateSpec
+	if err := yaml.UnmarshalStrict([]byte(templateYAML), &template); err != nil {
+		return pipeline{}, fmt.Errorf("data key %s: %w", templateKey, err)
 	}
 
 	return pipeline{
 		Name:       configMap.Name,
 		Repository: repository,
-		Image:      image,
 		Events:     events,
-		Sources:    sources,
-		Secrets:    secrets,
+		Template:   template,
 	}, nil
-}
-
-// The pipeline is always in its own source list, because it has to be laid out
-// like anything else, and it is put there first so the list reads as the thing
-// being run followed by what it calls. A named source is a ConfigMap in this
-// namespace carrying ball.tar.gz; the receiver never opens it, so a name that
-// does not resolve is a Pod that will not start rather than an error here.
-func parseSources(name, value string) ([]string, error) {
-	return parseResourceNames("ConfigMap", value, name)
-}
-
-func parseSecrets(value string) ([]string, error) {
-	return parseResourceNames("Secret", value)
-}
-
-func parseResourceNames(kind, value string, names ...string) ([]string, error) {
-	seen := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		seen[name] = struct{}{}
-	}
-	for _, value := range strings.Split(value, ",") {
-		name := strings.TrimSpace(value)
-		if name == "" {
-			continue
-		}
-		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
-			return nil, fmt.Errorf("%q is not a %s name: %s",
-				name, kind, strings.Join(errs, "; "))
-		}
-		if _, duplicate := seen[name]; duplicate {
-			continue
-		}
-		seen[name] = struct{}{}
-		names = append(names, name)
-	}
-	return names, nil
 }
 
 func parseEvents(value string) (map[string]struct{}, error) {
@@ -349,8 +263,6 @@ func newReceiver(
 		return nil, errors.New("organization is invalid")
 	case config.Namespace == "":
 		return nil, errors.New("job namespace is required")
-	case config.CoalesceURL == "":
-		return nil, errors.New("Coalesce URL is required")
 	case config.MaxBodyBytes <= 0:
 		return nil, errors.New("maximum body size must be positive")
 	case config.APITimeout <= 0:
@@ -612,73 +524,18 @@ func (receiver *receiver) job(
 ) *batchv1.Job {
 	backoffLimit := int32(0)
 	ttl := int32(3600)
-
-	// One mount per source, at the name the layout script iterates. The volume
-	// is named by position because a ConfigMap name may carry dots and a volume
-	// name may not; nothing reads the volume name, while the mount path is the
-	// whole interface.
-	mounts := []corev1.VolumeMount{
-		{Name: "src", MountPath: benchRoot + "/src"},
-		{Name: "webhook", MountPath: "/run/webhook", ReadOnly: true},
+	template := pipeline.Template.DeepCopy()
+	if template.Labels == nil {
+		template.Labels = make(map[string]string)
 	}
-	volumes := []corev1.Volume{
-		{
-			Name: "src",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
-		{
-			Name: "webhook",
-			VolumeSource: corev1.VolumeSource{
-				DownwardAPI: &corev1.DownwardAPIVolumeSource{
-					Items: []corev1.DownwardAPIVolumeFile{{
-						Path: "payload.json",
-						FieldRef: &corev1.ObjectFieldSelector{
-							FieldPath: "metadata.annotations['" +
-								webhookPayloadAnnotation + "']",
-						},
-					}},
-				},
-			},
-		},
+	if template.Annotations == nil {
+		template.Annotations = make(map[string]string)
 	}
-	for index, source := range pipeline.Sources {
-		name := fmt.Sprintf("source-%d", index)
-		mounts = append(mounts, corev1.VolumeMount{
-			Name:      name,
-			MountPath: benchRoot + "/mnt/" + source,
-			ReadOnly:  true,
-		})
-		volumes = append(volumes, corev1.Volume{
-			Name: name,
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: source},
-				},
-			},
-		})
-	}
-	secretMode := int32(0444)
-	for index, secret := range pipeline.Secrets {
-		name := fmt.Sprintf("secret-%d", index)
-		mounts = append(mounts, corev1.VolumeMount{
-			Name:      name,
-			MountPath: benchRoot + "/secrets/" + secret,
-			ReadOnly:  true,
-		})
-		// Kubelet may refresh this volume while a Job is running. A caller that
-		// needs one credential for the whole run must read the file once.
-		volumes = append(volumes, corev1.Volume{
-			Name: name,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  secret,
-					DefaultMode: &secretMode,
-				},
-			},
-		})
-	}
+	template.Labels["app.kubernetes.io/name"] = "coalesce-dispatch"
+	template.Labels["coalesce.flatheadmill.com/slug"] = slug
+	template.Annotations[webhookPayloadAnnotation] = string(payload)
+	template.Annotations["coalesce.flatheadmill.com/event"] = event
+	template.Annotations["coalesce.flatheadmill.com/delivery"] = delivery
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -689,60 +546,14 @@ func (receiver *receiver) job(
 				"coalesce.flatheadmill.com/slug": slug,
 			},
 			Annotations: map[string]string{
-				pipelineRepositoryAnnotation:         pipeline.Repository,
-				"coalesce.flatheadmill.com/event":    event,
-				"coalesce.flatheadmill.com/delivery": delivery,
-				pipelineLabel:                        pipeline.Name,
+				pipelineRepositoryAnnotation: pipeline.Repository,
+				pipelineLabel:                pipeline.Name,
 			},
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            &backoffLimit,
 			TTLSecondsAfterFinished: &ttl,
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app.kubernetes.io/name":         "coalesce-dispatch",
-						"coalesce.flatheadmill.com/slug": slug,
-					},
-					Annotations: map[string]string{
-						webhookPayloadAnnotation: string(payload),
-					},
-				},
-				Spec: corev1.PodSpec{
-					ServiceAccountName: "coalesce-runner",
-					RestartPolicy:      corev1.RestartPolicyNever,
-					ImagePullSecrets: []corev1.LocalObjectReference{
-						{Name: "registry"},
-					},
-					Containers: []corev1.Container{{
-						Name:            "pipeline",
-						Image:           pipeline.Image,
-						ImagePullPolicy: corev1.PullAlways,
-						// The house shape: zsh -c and a program you can read in
-						// the manifest — the layoutScript constant above, the
-						// same text in every Job, with the variance in env.
-						//
-						// tini leads it because Kubernetes sends TERM to PID 1
-						// alone. Without it a run blocked in a curl or kubectl
-						// finishes that child before its trap runs, and a pod
-						// killed mid-step records nothing.
-						Command: []string{"tini", "-g", "--", "zsh", "-c"},
-						Args:    []string{layoutScript},
-						Env: []corev1.EnvVar{
-							{Name: "COALESCE_NAMESPACE", Value: receiver.config.Namespace},
-							{Name: "COALESCE_PIPELINE", Value: pipeline.Name},
-							{Name: "COALESCE_SOURCES", Value: strings.Join(pipeline.Sources, " ")},
-							{Name: "COALESCE_SLUG", Value: slug},
-							{Name: "COALESCE_URL", Value: receiver.config.CoalesceURL},
-							{Name: "GITHUB_DELIVERY", Value: delivery},
-							{Name: "GITHUB_EVENT", Value: event},
-							{Name: "GITHUB_WEBHOOK_PAYLOAD_FILE", Value: webhookPayloadPath},
-						},
-						VolumeMounts: mounts,
-					}},
-					Volumes: volumes,
-				},
-			},
+			Template:                *template,
 		},
 	}
 }

@@ -21,7 +21,47 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-const testSecret = "correct horse battery staple"
+const (
+	testSecret           = "correct horse battery staple"
+	testPipelineTemplate = `{
+"metadata": {
+"labels": {
+"author.example/label": "kept",
+"coalesce.flatheadmill.com/slug": "author-value"
+},
+"annotations": {
+"author.example/annotation": "kept",
+"coalesce.flatheadmill.com/webhook-payload": "author-value",
+"coalesce.flatheadmill.com/event": "author-value",
+"coalesce.flatheadmill.com/delivery": "author-value"
+}
+},
+"spec": {
+"serviceAccountName": "author-runner",
+"restartPolicy": "Never",
+"imagePullSecrets": [{"name": "author-registry"}],
+"containers": [{
+"name": "pipeline",
+"image": "example.invalid/author:test",
+"imagePullPolicy": "IfNotPresent",
+"command": ["author", "command"],
+"args": ["author program"],
+"env": [
+{"name": "GITHUB_EVENT", "valueFrom": {"fieldRef": {"fieldPath": "metadata.annotations['coalesce.flatheadmill.com/event']"}}},
+{"name": "GITHUB_DELIVERY", "valueFrom": {"fieldRef": {"fieldPath": "metadata.annotations['coalesce.flatheadmill.com/delivery']"}}}
+],
+"volumeMounts": [{"name": "webhook", "mountPath": "/author/webhook", "readOnly": true}]
+}],
+"volumes": [{
+"name": "webhook",
+"downwardAPI": {"items": [{
+"path": "payload.json",
+"fieldRef": {"fieldPath": "metadata.annotations['coalesce.flatheadmill.com/webhook-payload']"}
+}]}
+}]
+}
+}`
+)
 
 var testNow = time.Unix(1_754_000_000, 0)
 
@@ -52,61 +92,75 @@ func TestReceiverDispatchesRawPayload(t *testing.T) {
 	if problems := validation.IsDNS1123Label(job.Name); len(problems) != 0 {
 		t.Fatalf("Job name %q is invalid: %v", job.Name, problems)
 	}
+	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 0 {
+		t.Fatalf("backoff limit = %v", job.Spec.BackoffLimit)
+	}
+	if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != 3600 {
+		t.Fatalf("TTL = %v", job.Spec.TTLSecondsAfterFinished)
+	}
+	if got := job.Labels["app.kubernetes.io/name"]; got != "coalesce-dispatch" {
+		t.Fatalf("Job app label = %q", got)
+	}
+	if got := job.Labels["coalesce.flatheadmill.com/slug"]; got != job.Name {
+		t.Fatalf("Job slug label = %q", got)
+	}
+	if got := job.Annotations[pipelineRepositoryAnnotation]; got != "example_inc/secrets.site" {
+		t.Fatalf("Job repository = %q", got)
+	}
+	if got := job.Annotations[pipelineLabel]; got != "secrets-build" {
+		t.Fatalf("Job pipeline = %q", got)
+	}
+	if _, ok := job.Annotations["coalesce.flatheadmill.com/event"]; ok {
+		t.Fatal("event remained on the Job")
+	}
+	if _, ok := job.Annotations["coalesce.flatheadmill.com/delivery"]; ok {
+		t.Fatal("delivery remained on the Job")
+	}
+
+	template := job.Spec.Template
+	if got := template.Labels["author.example/label"]; got != "kept" {
+		t.Fatalf("author label = %q", got)
+	}
+	if got := template.Labels["app.kubernetes.io/name"]; got != "coalesce-dispatch" {
+		t.Fatalf("Pod app label = %q", got)
+	}
+	if got := template.Annotations["author.example/annotation"]; got != "kept" {
+		t.Fatalf("author annotation = %q", got)
+	}
+	if got := template.Labels["coalesce.flatheadmill.com/slug"]; got != job.Name {
+		t.Fatalf("Pod slug label = %q", got)
+	}
+	if got := template.Annotations[webhookPayloadAnnotation]; got != string(body) {
+		t.Fatalf("payload annotation = %q, want %q", got, body)
+	}
+	if got := template.Annotations["coalesce.flatheadmill.com/event"]; got != "pull_request.synchronize" {
+		t.Fatalf("event annotation = %q", got)
+	}
+	if got := template.Annotations["coalesce.flatheadmill.com/delivery"]; got != "delivery-123" {
+		t.Fatalf("delivery annotation = %q", got)
+	}
+	if template.Spec.ServiceAccountName != "author-runner" {
+		t.Fatalf("service account = %q", template.Spec.ServiceAccountName)
+	}
+	if template.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("restart policy = %q", template.Spec.RestartPolicy)
+	}
+	if len(template.Spec.ImagePullSecrets) != 1 ||
+		template.Spec.ImagePullSecrets[0].Name != "author-registry" {
+		t.Fatalf("image pull secrets = %+v", template.Spec.ImagePullSecrets)
+	}
 	container := job.Spec.Template.Spec.Containers[0]
-	if container.Image != "example.invalid/runtime:test" {
+	if container.Image != "example.invalid/author:test" {
 		t.Fatalf("image = %q", container.Image)
 	}
-	if got := strings.Join(container.Command, " "); got != "tini -g -- zsh -c" {
+	if container.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Fatalf("image pull policy = %q", container.ImagePullPolicy)
+	}
+	if got := strings.Join(container.Command, " "); got != "author command" {
 		t.Fatalf("command = %q", got)
 	}
-	// The program is the same constant in every Job; the variance is data in
-	// the environment, asserted below.
-	if got := strings.Join(container.Args, " "); got != layoutScript {
+	if got := strings.Join(container.Args, " "); got != "author program" {
 		t.Fatalf("command line = %q", got)
-	}
-	if got := mountPath(container.VolumeMounts, "source-0"); got != benchRoot+"/mnt/secrets-build" {
-		t.Fatalf("pipeline source mounted at %q", got)
-	}
-	if got := mountPath(container.VolumeMounts, "src"); got != benchRoot+"/src" {
-		t.Fatalf("source trees mounted at %q", got)
-	}
-	if got := mountPath(container.VolumeMounts, "secret-0"); got != "" {
-		t.Fatalf("undeclared Secret mounted at %q", got)
-	}
-
-	env := environmentMap(container.Env)
-	want := map[string]string{
-		"COALESCE_NAMESPACE":          "coalesce",
-		"COALESCE_PIPELINE":           "secrets-build",
-		"COALESCE_SOURCES":            "secrets-build",
-		"COALESCE_SLUG":               "secrets-build-511-t0ab28",
-		"COALESCE_URL":                "http://coalesce.coalesce.svc.cluster.local",
-		"GITHUB_DELIVERY":             "delivery-123",
-		"GITHUB_EVENT":                "pull_request.synchronize",
-		"GITHUB_WEBHOOK_PAYLOAD_FILE": webhookPayloadPath,
-	}
-	for name, value := range want {
-		if env[name] != value {
-			t.Errorf("%s = %q, want %q", name, env[name], value)
-		}
-	}
-	if _, ok := env["GITHUB_WEBHOOK_PAYLOAD"]; ok {
-		t.Error("raw payload remained in the container environment")
-	}
-
-	// The whole ConfigMap is mounted rather than a named key. Every source
-	// carries ball.tar.gz, but selecting it with items would turn a wrong key
-	// into a mount that never resolves and a Pod stuck ContainerCreating;
-	// mounting whole lets tar fail fast and name the missing path.
-	volume := volumeNamed(job.Spec.Template.Spec.Volumes, "source-0")
-	if volume.ConfigMap == nil || volume.ConfigMap.Name != "secrets-build" {
-		t.Fatalf("pipeline source volume = %+v", volume.VolumeSource)
-	}
-	if len(volume.ConfigMap.Items) != 0 {
-		t.Fatalf("source selected keys %+v", volume.ConfigMap.Items)
-	}
-	if got := job.Spec.Template.Annotations[webhookPayloadAnnotation]; got != string(body) {
-		t.Fatalf("payload annotation = %q, want %q", got, body)
 	}
 	webhook := volumeNamed(job.Spec.Template.Spec.Volumes, "webhook").DownwardAPI.Items[0]
 	if webhook.Path != "payload.json" {
@@ -138,131 +192,53 @@ func TestReceiverDispatchesBareEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := environmentMap(jobs.Items[0].Spec.Template.Spec.Containers[0].Env)["GITHUB_EVENT"]
+	got := jobs.Items[0].Spec.Template.Annotations["coalesce.flatheadmill.com/event"]
 	if got != "push" {
 		t.Fatalf("GITHUB_EVENT = %q", got)
 	}
 }
 
-// A pipeline that calls a library names it as a source, and the whole cost of
-// that on the receiver's side is one more mount and one more word in
-// COALESCE_SOURCES. The order asserted here is the order the list is built in,
-// not a contract the script depends on — it cds into COALESCE_PIPELINE, which
-// arrives separately. What the order buys is a readable list and a mount whose
-// position matches it.
-func TestReceiverMountsNamedSourcesInOrder(t *testing.T) {
-	handler, client, pipelines := testReceiver(t, 1<<20)
-	configMap := pipelineConfigMap(
-		"secrets-build",
-		"example_inc/secrets.site",
-		"pull_request.synchronize",
-	)
-	configMap.Annotations[pipelineSourcesAnnotation] = "millwright, secrets-build ,toolbelt"
-	pipelines.upsert(configMap)
-	response := httptest.NewRecorder()
-
-	handler.ServeHTTP(response, signedRequest(t, "pull_request",
-		validPayload("Example_Inc/Secrets.Site", "synchronize"), testSecret))
-
-	if response.Code != http.StatusCreated {
-		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
-	}
-	jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	pod := jobs.Items[0].Spec.Template.Spec
-	container := pod.Containers[0]
-	// The pipeline names itself among its sources; it is still listed once, and
-	// still first.
-	sources := environmentMap(container.Env)["COALESCE_SOURCES"]
-	if sources != "secrets-build millwright toolbelt" {
-		t.Fatalf("COALESCE_SOURCES = %q", sources)
-	}
-	for index, source := range []string{"secrets-build", "millwright", "toolbelt"} {
-		volume := fmt.Sprintf("source-%d", index)
-		if got := mountPath(container.VolumeMounts, volume); got != benchRoot+"/mnt/"+source {
-			t.Errorf("%s mounted at %q", source, got)
-		}
-		if got := configMapVolume(pod.Volumes, volume); got != source {
-			t.Errorf("%s backed by ConfigMap %q", source, got)
-		}
-	}
-}
-
-func TestPipelineCacheRejectsUnusableSourceName(t *testing.T) {
+func TestPipelineCacheRejectsUnknownTemplateField(t *testing.T) {
+	pipelines := newPipelineCache("example_inc")
 	configMap := pipelineConfigMap(
 		"secrets-build",
 		"example_inc/secrets.site",
 		"push",
 	)
-	configMap.Annotations[pipelineSourcesAnnotation] = "Not A ConfigMap"
+	configMap.Data[templateKey] = "spec:\n  computeResources: {}\n"
+	if _, err := pipelineFromConfigMap(configMap, "example_inc"); err == nil ||
+		!strings.Contains(err.Error(), "computeResources") {
+		t.Fatalf("strict decode error = %v", err)
+	}
+	pipelines.upsert(configMap)
 
-	if _, err := pipelineFromConfigMap(configMap, "example_inc"); err == nil {
-		t.Fatal("a source name that cannot resolve to a ConfigMap was accepted")
+	if got := pipelines.matching("example_inc/secrets.site", "push"); len(got) != 0 {
+		t.Fatalf("invalid template produced %d matches", len(got))
 	}
 }
 
-func TestReceiverMountsNamedSecretsInOrder(t *testing.T) {
-	handler, client, pipelines := testReceiver(t, 1<<20)
-	configMap := pipelineConfigMap(
-		"secrets-build",
+func TestReceiverDeepCopiesCachedTemplate(t *testing.T) {
+	handler, _, pipelines := testReceiver(t, 1<<20)
+	pipeline := pipelines.matching(
 		"example_inc/secrets.site",
 		"pull_request.synchronize",
-	)
-	configMap.Annotations[pipelineSecretsAnnotation] =
-		"github-status, registry.credentials ,github-status"
-	pipelines.upsert(configMap)
-	response := httptest.NewRecorder()
+	)[0]
+	first := handler.job(pipeline, "first", "first.event", "first-delivery", []byte("first"))
+	_ = handler.job(pipeline, "second", "second.event", "second-delivery", []byte("second"))
 
-	handler.ServeHTTP(response, signedRequest(t, "pull_request",
-		validPayload("Example_Inc/Secrets.Site", "synchronize"), testSecret))
-
-	if response.Code != http.StatusCreated {
-		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	if got := first.Spec.Template.Annotations[webhookPayloadAnnotation]; got != "first" {
+		t.Fatalf("first payload changed to %q", got)
 	}
-	jobs, err := client.BatchV1().Jobs("coalesce").List(t.Context(), metav1.ListOptions{})
-	if err != nil {
-		t.Fatal(err)
+	if got := pipeline.Template.Annotations[webhookPayloadAnnotation]; got != "author-value" {
+		t.Fatalf("cached payload changed to %q", got)
 	}
-	pod := jobs.Items[0].Spec.Template.Spec
-	container := pod.Containers[0]
-	for index, secret := range []string{"github-status", "registry.credentials"} {
-		name := fmt.Sprintf("secret-%d", index)
-		mount := volumeMountNamed(container.VolumeMounts, name)
-		if mount.MountPath != benchRoot+"/secrets/"+secret {
-			t.Errorf("%s mounted at %q", secret, mount.MountPath)
-		}
-		if !mount.ReadOnly {
-			t.Errorf("%s mount is writable", secret)
-		}
-		volume := volumeNamed(pod.Volumes, name)
-		if volume.Secret == nil || volume.Secret.SecretName != secret {
-			t.Errorf("%s backed by %+v", secret, volume.VolumeSource)
-			continue
-		}
-		if len(volume.Secret.Items) != 0 {
-			t.Errorf("%s selected keys %+v", secret, volume.Secret.Items)
-		}
-		if volume.Secret.Optional != nil {
-			t.Errorf("%s optional = %v", secret, *volume.Secret.Optional)
-		}
-		if volume.Secret.DefaultMode == nil || *volume.Secret.DefaultMode != 0444 {
-			t.Errorf("%s mode = %v", secret, volume.Secret.DefaultMode)
-		}
-	}
-}
 
-func TestPipelineCacheRejectsUnusableSecretName(t *testing.T) {
-	configMap := pipelineConfigMap(
-		"secrets-build",
-		"example_inc/secrets.site",
-		"push",
-	)
-	configMap.Annotations[pipelineSecretsAnnotation] = "Not A Secret"
-
-	if _, err := pipelineFromConfigMap(configMap, "example_inc"); err == nil {
-		t.Fatal("a Secret name that Kubernetes cannot resolve was accepted")
+	withoutMetadata := pipeline
+	withoutMetadata.Template.ObjectMeta = metav1.ObjectMeta{}
+	job := handler.job(withoutMetadata, "third", "third.event", "third-delivery", []byte("third"))
+	if job.Spec.Template.Labels["coalesce.flatheadmill.com/slug"] != "third" ||
+		job.Spec.Template.Annotations[webhookPayloadAnnotation] != "third" {
+		t.Fatalf("empty metadata was not stamped: %+v", job.Spec.Template.ObjectMeta)
 	}
 }
 
@@ -416,7 +392,7 @@ func TestPipelineCacheRejectsIncompleteContract(t *testing.T) {
 		"example_inc/secrets.site",
 		"pull_request.synchronize",
 	)
-	delete(configMap.Annotations, pipelineImageAnnotation)
+	delete(configMap.Data, templateKey)
 
 	pipelines.upsert(configMap)
 
@@ -704,7 +680,6 @@ func testReceiver(
 			Secret:       []byte(testSecret),
 			Organization: "example_inc",
 			Namespace:    "coalesce",
-			CoalesceURL:  "http://coalesce.coalesce.svc.cluster.local",
 			MaxBodyBytes: maxBodyBytes,
 			APITimeout:   time.Second,
 		},
@@ -727,26 +702,15 @@ func pipelineConfigMap(name, repository, events string) *corev1.ConfigMap {
 			Annotations: map[string]string{
 				pipelineRepositoryAnnotation: repository,
 				pipelineEventsAnnotation:     events,
-				pipelineImageAnnotation:      "example.invalid/runtime:test",
 			},
+		},
+		Data: map[string]string{
+			templateKey: testPipelineTemplate,
 		},
 		BinaryData: map[string][]byte{
 			archiveKey: []byte("tar bytes"),
 		},
 	}
-}
-
-func mountPath(mounts []corev1.VolumeMount, name string) string {
-	return volumeMountNamed(mounts, name).MountPath
-}
-
-func volumeMountNamed(mounts []corev1.VolumeMount, name string) corev1.VolumeMount {
-	for _, mount := range mounts {
-		if mount.Name == name {
-			return mount
-		}
-	}
-	return corev1.VolumeMount{}
 }
 
 func volumeNamed(volumes []corev1.Volume, name string) corev1.Volume {
@@ -756,21 +720,6 @@ func volumeNamed(volumes []corev1.Volume, name string) corev1.Volume {
 		}
 	}
 	return corev1.Volume{}
-}
-
-func configMapVolume(volumes []corev1.Volume, name string) string {
-	if volume := volumeNamed(volumes, name); volume.ConfigMap != nil {
-		return volume.ConfigMap.Name
-	}
-	return ""
-}
-
-func environmentMap(environment []corev1.EnvVar) map[string]string {
-	values := make(map[string]string, len(environment))
-	for _, variable := range environment {
-		values[variable.Name] = variable.Value
-	}
-	return values
 }
 
 type failingReader struct{}

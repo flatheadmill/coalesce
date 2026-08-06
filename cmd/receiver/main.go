@@ -22,9 +22,8 @@ import (
 )
 
 const (
-	defaultAddress     = ":8080"
-	defaultNamespace   = "coalesce"
-	defaultCoalesceURL = "http://coalesce.coalesce.svc.cluster.local"
+	defaultAddress   = ":8080"
+	defaultNamespace = "coalesce"
 	// The signed body becomes a pod annotation so an oversized webhook fails
 	// while the receiver is creating the Job, before GitHub sees green. The API
 	// server allows roughly 256 KiB across an object's annotations; 192 KiB
@@ -120,7 +119,6 @@ func configFromEnvironment() (receiverConfig, string, error) {
 		Secret:       []byte(secret),
 		Organization: organization,
 		Namespace:    environment("JOB_NAMESPACE", defaultNamespace),
-		CoalesceURL:  environment("COALESCE_URL", defaultCoalesceURL),
 		MaxBodyBytes: maxBodyBytes,
 		APITimeout:   defaultAPITimeout,
 	}
