@@ -20,7 +20,7 @@ This is pushing coalesce toward proper zshctl structure: `coalesce run` and `coa
 
 **Wed Jan 21 01:26:00 PM CST 2026 - Resuming After Hiatus**
 
-Alan returned to Coalesce after several months away. During that time he completed a "once and for all" rewrite of zshctl and examplectl, answering questions like "what is the fastest way to slurp a file in Zsh" and "how do you evaluate something in the user's dynamic scope without polluting the namespace." The foundation work was necessary before building more on Zsh, and now bin/coalesce sits atop that solid base.
+Alan returned to Coalesce after several months away. During that time he completed a "once and for all" rewrite of zshctl, answering questions like "what is the fastest way to slurp a file in Zsh" and "how do you evaluate something in the user's dynamic scope without polluting the namespace." The foundation work was necessary before building more on Zsh, and now bin/coalesce sits atop that solid base.
 
 The core executor works. The DAG traversal, the kubectl watch loop that feeds itself when new jobs are created, the nested sync points with parallel and serial execution - all proven with the fanout test case. The mTLS connection to PostgreSQL is working. The pieces are in place.
 
