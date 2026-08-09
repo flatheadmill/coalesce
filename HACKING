@@ -103,9 +103,23 @@ no port-forward:
     curl http://coalesce.coalesce.svc.cluster.local/health
 
 The same address works from curl, the browser, and any process on the Mac.
-The UI prototype is served at the root:
+The run table is served at the root — the UI rides embedded in the server
+image, built by the Dockerfile's node stage, so deploying the server deploys
+the UI:
 
-    http://coalesce.coalesce.svc.cluster.local/?namespace=coalesce&slug=hello-1
+    http://coalesce.coalesce.svc.cluster.local/coalesce/runs
+
+The old prototype remains at /run.html until its role is fully retired. For
+UI development the loop is Vite on the Mac, proxying /api and /events to the
+cluster:
+
+    cd ui && npm install && npm run dev
+
+A bare `go build ./cmd/web` always compiles — a tracked placeholder satisfies
+the embed on a clean clone — but a binary built that way serves a plain-text
+notice at the root instead of the app. To embed the app in a bare build, run
+`(cd ui && npm run build)` first. The docker build runs both stages itself
+and is the path that ships.
 
 ---
 
@@ -277,8 +291,9 @@ Layout
     cmd/web/main.go                 Go server
     cmd/web/migrations/             Database schema
     cmd/receiver/                   Webhook receiver
-    run.html                        UI prototype (Cytoscape + xterm)
+    run.html                        Old UI prototype (served at /run.html)
     test/                           Pipeline test definitions
+    ui/                             The run table (Vite, React, TypeScript)
     manifests/local/                The local environment (this file's subject)
     manifests/                      Older manifests, kept beside
     Dockerfile                      Server image

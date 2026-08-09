@@ -1,1 +1,5 @@
 /web
+ui/node_modules
+cmd/web/dist/*
+!cmd/web/dist/.gitkeep
+*.tsbuildinfo

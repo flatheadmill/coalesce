@@ -1,0 +1,223 @@
+/* The ledger is typographic: hairline rules, no boxes, two sizes on the
+ * page, hierarchy from weight and spacing. No urgency styling anywhere —
+ * this is the hangar, and the reader has coffee. */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--gunmetal);
+  color: var(--lamplight);
+  font: 14px/1.5 var(--voice);
+}
+
+#root {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 36px 24px 80px;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+a:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--lamplight);
+  outline-offset: 2px;
+}
+
+/* Nameplate — the engraved header; the machine-age accent is tracking and
+ * case, and this is the whole whimsy budget. */
+.nameplate {
+  font: 600 14px var(--voice);
+  letter-spacing: var(--tracking-nameplate);
+  text-transform: uppercase;
+  color: var(--lamplight);
+  margin: 0 0 4px;
+}
+
+.nameplate a:hover {
+  color: var(--lamplight);
+}
+
+/* The dated filter line — set text; a screenshot is a labeled subset. */
+.filter-line {
+  color: var(--filings);
+  font-size: 13px;
+  margin: 0 0 28px;
+}
+
+.filter-line select {
+  background: none;
+  border: none;
+  color: var(--filings);
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* The floor — machines, while they live. Roomy entries, no bottom rule:
+ * the record still being made. */
+.floor {
+  margin: 0 0 36px;
+}
+
+.floor-entry {
+  display: flex;
+  align-items: baseline;
+  gap: 24px;
+  padding: 18px 4px;
+  border-top: 1px solid var(--graphite);
+  font-family: var(--figures);
+}
+
+.floor-entry .slug {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.floor-entry .step {
+  color: var(--filings);
+  flex: 1;
+}
+
+.floor-entry .step b {
+  color: var(--lamplight);
+  font-weight: 400;
+}
+
+.floor-entry .counting {
+  font-variant-numeric: tabular-nums;
+  font-size: 15px;
+}
+
+/* The ledger — records, once dead. Dense still rows. */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--figures);
+  font-size: 13px;
+}
+
+th {
+  font: 600 11px var(--voice);
+  letter-spacing: var(--tracking-heads);
+  text-transform: uppercase;
+  color: var(--filings);
+  text-align: left;
+  padding: 6px 16px 6px 4px;
+  border-bottom: 1px solid var(--graphite);
+}
+
+td {
+  padding: 7px 16px 7px 4px;
+  border-bottom: 1px solid var(--graphite);
+  white-space: nowrap;
+}
+
+td.dim {
+  color: var(--filings);
+}
+
+td.num,
+th.num {
+  text-align: right;
+  padding-right: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+tr.rowlink {
+  cursor: pointer;
+}
+
+.status-failed {
+  color: var(--cracked);
+}
+
+.status-quiet {
+  color: var(--filings);
+}
+
+/* The closed book — the third reader's welcome. */
+.empty {
+  border-top: 1px solid var(--graphite);
+  padding-top: 32px;
+}
+
+.empty p {
+  color: var(--filings);
+  margin: 0 0 12px;
+}
+
+.empty pre {
+  font-family: var(--figures);
+  font-size: 13px;
+  color: var(--lamplight);
+  background: none;
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+/* Logs — honest preformatted text, the log that says why. */
+.log {
+  font-family: var(--figures);
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  margin: 0;
+}
+
+.crumb {
+  color: var(--filings);
+  font-size: 13px;
+  margin: 0 0 24px;
+}
+
+.crumb a:hover {
+  color: var(--lamplight);
+}
+
+.detail-head {
+  display: flex;
+  align-items: baseline;
+  gap: 24px;
+  font-family: var(--figures);
+  margin: 0 0 24px;
+}
+
+.detail-head .slug {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.detail-head .dim {
+  color: var(--filings);
+}
+
+.error {
+  color: var(--filings);
+  border-top: 1px solid var(--graphite);
+  padding-top: 24px;
+}
+
+.error code {
+  font-family: var(--figures);
+  color: var(--lamplight);
+}
+
+/* Narrow: pipeline goes first, then started; slug, status, duration last. */
+@media (max-width: 720px) {
+  .col-pipeline {
+    display: none;
+  }
+}
+
+@media (max-width: 520px) {
+  .col-started {
+    display: none;
+  }
+}

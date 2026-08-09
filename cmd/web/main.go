@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"log/slog"
 	"net/http"
@@ -49,6 +50,14 @@ var (
 
 //go:embed migrations/*.sql
 var migrations embed.FS
+
+// The UI rides in the binary — built output embedded and versioned with the
+// server, per the settled asset contract. Built by the Dockerfile's node
+// stage into cmd/web/dist; a bare `go build ./cmd/web` needs
+// `(cd ui && npm run build)` first.
+//
+//go:embed all:dist
+var dist embed.FS
 
 // WebSocket event types
 type Event struct {
@@ -988,14 +997,44 @@ func main() {
 	// Health
 	mux.HandleFunc("GET /health", handleHealth)
 
-	// Serve static files
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("."))))
+	// The old prototype stays reachable at /run.html until its role is fully
+	// retired. It carries everything it needs from CDNs; the /static/
+	// directory-server it once rode beside is gone — http.Dir(".") from /app
+	// served the binary itself to anyone who asked.
+	mux.HandleFunc("/run.html", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "run.html")
+	})
+
+	// The embedded app: real files by name, index.html for everything else,
+	// so a direct refresh on a deep route like /coalesce/runs/hello-1 lands
+	// in the router instead of a 404. A clean clone compiles because the
+	// tracked dist/.gitkeep satisfies the all: pattern; a binary built that
+	// way says so plainly instead of serving a bare 404.
+	ui, uiErr := fs.Sub(dist, "dist")
+	if uiErr != nil {
+		log.Fatalf("Embedded UI missing: %v", uiErr)
+	}
+	_, uiBuiltErr := fs.Stat(ui, "index.html")
+	uiBuilt := uiBuiltErr == nil
+	if !uiBuilt {
+		slog.Warn("UI not embedded in this binary; / serves a notice",
+			"fix", "(cd ui && npm run build) and rebuild, or use docker build")
+	}
+	uiFiles := http.FileServer(http.FS(ui))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
-			http.ServeFile(w, r, "run.html")
-		} else {
-			http.NotFound(w, r)
+		if !uiBuilt {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintln(w, "This binary was built without the UI. Run (cd ui && npm run build) and rebuild, or use docker build, which builds both.")
+			return
 		}
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path != "" && path != "index.html" {
+			if _, err := fs.Stat(ui, path); err == nil {
+				uiFiles.ServeHTTP(w, r)
+				return
+			}
+		}
+		http.ServeFileFS(w, r, ui, "index.html")
 	})
 
 	addr := fmt.Sprintf(":%d", port)
