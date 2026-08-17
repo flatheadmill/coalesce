@@ -1,0 +1,56 @@
+#!/usr/bin/env zsh
+
+# Emits the DAG as JSON for visualization without running anything. The Zsh
+# side does a flat recursive descent emitting one jo line per node, then jq
+# reconstructs the tree by matching `under` fields. This split keeps the Zsh
+# simple (no JSON nesting) and lets jq handle the structure.
+function _coalesce_dag_descend_json {
+    typeset dag=${1:-} queue=() node
+    shift
+    integer parallel
+    queue=( "${(@AQ)${(z)_coalesce[${dag}:queue]}}" )
+    for node in "${(@)queue}"; do
+        case $_coalesce[${dag}.${node}:kind] in
+        (tranche)
+            parallel=$(( _coalesce[${dag}.${node}:parallel] != 1 ))
+            jo -- name=$node under=${dag} kind=tranche -b parallel=$parallel
+            _coalesce_dag_descend_json ${dag}.${node}
+            ;;
+        (pod)
+            jo -- name=$node under=${dag} kind=node
+            ;;
+        esac
+    done
+}
+
+function _coalesce_dag_json {
+    _coalesce_dag_descend_json coalesce | jq --slurp '
+        . as $all |
+        def find_children($path):
+            $all[] |
+            select(.under == $path) |
+            . as $node |
+            . + {
+                children: [
+                    $all | find_children(
+                        if $path == null then $node.name
+                        else $path + "." + $node.name
+                        end
+                    )
+                ]
+            };
+        [find_children("coalesce")]
+    '
+}
+
+function :args:dag {
+    eval "$(args s,slug N,namespace -bx h,help -- "$@")"
+}
+
+function :execute:dag {
+    [[ -v o_slug ]] || abend 'slug is required'
+    [[ -v o_namespace ]] || o_namespace=default
+    _coalesce_init
+    source $1
+    _coalesce_dag_json
+}

@@ -1,0 +1,12 @@
+#!/bin/zsh
+
+# The proof of the whole transport: two ConfigMaps rendered by one tool,
+# applied independently, both mounted by the include, both laid out by the
+# Job's own script — and a function crossing from one source tree into another
+# through nothing but source. The module system is a mount, a tar, and a
+# builtin. When this prints, every layer beneath it is done.
+
+setopt errexit
+
+source /run/coalesce/src/library/say_hello.zsh
+say_hello_world

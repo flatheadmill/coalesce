@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1
+
+# The local dispatch image — what a receiver-created Job runs when the world
+# is a laptop. The receiver's layout script needs tini, zsh, and tar, and a
+# pipeline's run needs its interpreter; this image is those facts and nothing
+# else. tini is named on the Job's own command line, so it is installed to be
+# found on PATH, not wired in as an entrypoint. The Job carries its whole
+# program in its args, where the manifest shows it, so this image has no
+# entrypoint hiding part of that program elsewhere.
+#
+# Ubuntu rather than alpine, for two reasons that outlive the image being
+# small. zshctl's apt repository serves arch `all` — the package is noarch
+# shell and apt says so cleanly, where the apk side indexes only x86_64 today
+# — so this builds native on Apple Silicon with no Rosetta pin. And Ubuntu is
+# what our own pipeline images run, so a pipeline developed against this image
+# meets the same userland its production sibling will.
+#
+# zshctl comes from its public signed apt repository — key, source, package,
+# the same three steps its own Ubuntu installer performs. The installer
+# itself is for workstations: it pages, asks, and reaches for sudo, and a
+# Dockerfile is already root with nobody to ask. zshctl is here because a
+# pipeline's run file is a zshctl program — the executor is one — and a local
+# pipeline should get to be one too.
+#
+# This image stays these facts and does not grow into a pipeline toolbox. The
+# local world depends on nothing private — Coalesce is open source, and a
+# stranger cloning it gets an environment that runs. The pulls here are ubuntu
+# and zshctl.sh, both public. A pipeline that wants an organization's own verbs
+# is running that organization's pipelines, and belongs on a cluster holding
+# its credentials.
+FROM ubuntu:24.04
+ADD https://zshctl.sh/keys/gpg /tmp/zshctl.gpg.asc
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gnupg2 ca-certificates \
+ && gpg --yes --dearmor -o /usr/share/keyrings/zshctl.gpg /tmp/zshctl.gpg.asc \
+ && rm /tmp/zshctl.gpg.asc \
+ && echo 'deb [arch=all signed-by=/usr/share/keyrings/zshctl.gpg] https://zshctl.sh/apt stable main' > /etc/apt/sources.list.d/zshctl.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends zsh tini zshctl \
+ && rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,19 @@
+/* The design language as tokens — the blessed plan, verbatim. The wireframe
+ * hardens through this file: refinement edits tokens, never hunts hexes. */
+:root {
+  /* One pigment and four neutrals, measured against gunmetal. */
+  --gunmetal: #171B21;  /* the ground */
+  --lamplight: #C9D3DD; /* primary figures and text — 11.4:1 */
+  --filings: #8C96A2;   /* secondary ink — 5.7:1 */
+  --graphite: #262D36;  /* hairline rules; carries no meaning */
+  --cracked: #F2655C;   /* the word "failed", nowhere else — 5.6:1 */
+
+  /* Three roles, two faces, zero downloads. */
+  --figures: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --voice: system-ui, -apple-system, "Segoe UI", sans-serif;
+  /* Nameplate is Voice at 600 with tracking — a treatment, not a face. */
+  --tracking-nameplate: 0.14em;
+  --tracking-heads: 0.08em;
+
+  --measure: 1100px;
+}
