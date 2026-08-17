@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pipeline DAG - Coalesce</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <style>
+        body {
+            font-family: monospace;
+            margin: 0;
+            padding: 20px;
+            background: #1e1e1e;
+        }
+        #cy {
+            width: 100%;
+            height: 600px;
+            border: 1px solid #444;
+            background: #2d2d2d;
+        }
+        h1 {
+            color: #e0e0e0;
+            font-size: 18px;
+        }
+        .info {
+            color: #b0b0b0;
+            margin-top: 10px;
+        }
+        #terminal {
+            margin-top: 20px;
+            border: 1px solid #444;
+        }
+        #controls {
+            margin-bottom: 10px;
+            color: #b0b0b0;
+        }
+        #controls input {
+            background: #2d2d2d;
+            color: #e0e0e0;
+            border: 1px solid #444;
+            padding: 4px 8px;
+            font-family: monospace;
+        }
+        #controls button {
+            background: #444;
+            color: #e0e0e0;
+            border: 1px solid #666;
+            padding: 4px 12px;
+            font-family: monospace;
+            cursor: pointer;
+        }
+        #status {
+            color: #666;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Coalesce</h1>
+    <div id="controls">
+        <label>namespace: <input id="namespace" value="default" size="10"></label>
+        <label>slug: <input id="slug" value="" size="20"></label>
+        <button id="load">load</button>
+    </div>
+    <div id="status"></div>
+    <div id="cy"></div>
+    <div class="info" id="info">Click a running pod to tail its logs.</div>
+    <div id="terminal"></div>
+
+    <script>
+        const params = new URLSearchParams(location.search)
+        if (params.get('namespace')) document.getElementById('namespace').value = params.get('namespace')
+        if (params.get('slug')) document.getElementById('slug').value = params.get('slug')
+
+        let cy = null
+        let ws = null
+        let tailingJob = null
+
+        const term = new Terminal({
+            rows: 24,
+            cols: 120,
+            theme: { background: '#1e1e1e', foreground: '#d4d4d4' }
+        })
+        term.open(document.getElementById('terminal'))
+
+        function status(msg) {
+            document.getElementById('status').textContent = msg
+        }
+
+        // The DAG JSON from the server uses "tranche" for sync points and
+        // "node" for pods. The `under` field uses dots (coalesce.fanout.baz)
+        // which matches the job paths in events, so node IDs are just
+        // under.name — no translation needed between the graph and the
+        // event stream.
+        function nodeClasses(step) {
+            if (step.kind === 'node') return 'pod'
+            return step.parallel ? 'tranche-parallel' : 'tranche-serial'
+        }
+
+        function buildGraph(steps, previous) {
+            const nodes = []
+            const edges = []
+
+            function walkParallel(step, prev) {
+                const next = []
+                for (const child of step.children) {
+                    const id = `${child.under}.${child.name}`
+                    nodes.push({
+                        data: { id, label: child.name, kind: child.kind, job: id },
+                        classes: nodeClasses(child)
+                    })
+                    for (const source of prev) {
+                        edges.push({ data: { source, target: id } })
+                    }
+                    next.push(...walkSerial(child.children, [id]))
+                }
+                return next
+            }
+
+            function walkSerial(steps, prev) {
+                for (const step of steps) {
+                    const id = `${step.under}.${step.name}`
+                    nodes.push({
+                        data: { id, label: step.name, kind: step.kind, job: id },
+                        classes: nodeClasses(step)
+                    })
+                    if (prev.length) {
+                        for (const source of prev) {
+                            edges.push({ data: { source, target: id } })
+                        }
+                    }
+                    if (step.children.length) {
+                        if (step.parallel) {
+                            prev = walkParallel(step, [id])
+                        } else {
+                            prev = walkSerial(step.children, [id])
+                        }
+                    } else {
+                        prev = [id]
+                    }
+                }
+                return prev
+            }
+
+            // Root node
+            nodes.push({
+                data: { id: 'coalesce', label: 'coalesce', kind: 'tranche', job: 'coalesce' },
+                classes: 'tranche-serial'
+            })
+
+            walkSerial(steps, ['coalesce'])
+
+            return { nodes, edges }
+        }
+
+        function createCytoscape(elements) {
+            if (cy) cy.destroy()
+            cy = cytoscape({
+                container: document.getElementById('cy'),
+                elements,
+                style: [
+                    {
+                        selector: 'node',
+                        style: {
+                            'background-color': '#4a9eff',
+                            'label': 'data(label)',
+                            'color': '#ffffff',
+                            'text-valign': 'center',
+                            'text-halign': 'center',
+                            'font-size': '12px',
+                            'font-family': 'monospace',
+                            'width': '80px',
+                            'height': '40px',
+                            'shape': 'roundrectangle'
+                        }
+                    },
+                    {
+                        selector: '.tranche-serial',
+                        style: {
+                            'background-color': '#666',
+                            'shape': 'ellipse',
+                            'width': '60px',
+                            'height': '60px'
+                        }
+                    },
+                    {
+                        selector: '.tranche-parallel',
+                        style: {
+                            'background-color': '#ff9900',
+                            'shape': 'diamond',
+                            'width': '70px',
+                            'height': '70px'
+                        }
+                    },
+                    {
+                        selector: '.job-running',
+                        style: {
+                            'background-color': '#2196F3',
+                            'border-width': 3,
+                            'border-color': '#64B5F6',
+                            'border-style': 'solid'
+                        }
+                    },
+                    {
+                        selector: '.job-completed',
+                        style: {
+                            'background-color': '#4CAF50',
+                            'border-width': 0
+                        }
+                    },
+                    {
+                        selector: '.job-failed',
+                        style: {
+                            'background-color': '#f44336',
+                            'border-width': 0
+                        }
+                    },
+                    {
+                        selector: 'edge',
+                        style: {
+                            'width': 2,
+                            'line-color': '#888',
+                            'target-arrow-color': '#888',
+                            'target-arrow-shape': 'triangle',
+                            'curve-style': 'taxi',
+                            'taxi-direction': 'downward',
+                            'taxi-turn': '50px',
+                            'taxi-turn-min-distance': '10px'
+                        }
+                    },
+                    {
+                        selector: 'node:selected',
+                        style: {
+                            'border-width': 2,
+                            'border-color': '#ffffff'
+                        }
+                    }
+                ],
+                layout: {
+                    name: 'breadthfirst',
+                    directed: true,
+                    spacingFactor: 1.5,
+                    nodeDimensionsIncludeLabels: true
+                }
+            })
+
+            cy.on('tap', 'node', function (evt) {
+                const data = evt.target.data()
+                if (data.kind !== 'node') return
+                const namespace = document.getElementById('namespace').value
+                const slug = document.getElementById('slug').value
+                startTailing(namespace, slug, data.job)
+            })
+        }
+
+        // Apply job statuses from the run detail to color nodes that
+        // completed before the WebSocket connected.
+        function applyRunState(run) {
+            if (!cy || !run.jobs) return
+            for (const job of run.jobs) {
+                const node = cy.$(`#${CSS.escape(job.job)}`)
+                if (node.length === 0) continue
+                if (job.status === 'completed') {
+                    node.removeClass('job-running').addClass('job-completed')
+                } else if (job.status === 'failed') {
+                    node.removeClass('job-running').addClass('job-failed')
+                } else if (job.status === 'running') {
+                    node.addClass('job-running')
+                }
+            }
+        }
+
+        function connectWebSocket(namespace, slug) {
+            if (ws) ws.close()
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+            ws = new WebSocket(`${protocol}//${location.host}/events/${namespace}/${slug}`)
+
+            ws.onmessage = function (event) {
+                const msg = JSON.parse(event.data)
+                const data = msg.data || {}
+                switch (msg.kind) {
+                case 'connected':
+                    status(`connected to ${data.namespace}/${data.slug}`)
+                    break
+                case 'job_started':
+                    if (cy) {
+                        const node = cy.$(`#${CSS.escape(data.job)}`)
+                        node.addClass('job-running')
+                    }
+                    break
+                case 'job_completed':
+                    if (cy) {
+                        const node = cy.$(`#${CSS.escape(data.job)}`)
+                        node.removeClass('job-running').addClass('job-completed')
+                    }
+                    break
+                case 'job_failed':
+                    if (cy) {
+                        const node = cy.$(`#${CSS.escape(data.job)}`)
+                        node.removeClass('job-running').addClass('job-failed')
+                    }
+                    break
+                case 'log_line':
+                    if (data.job === tailingJob) {
+                        term.writeln(data.line)
+                    }
+                    break
+                case 'log_status':
+                    if (data.job === tailingJob) {
+                        term.writeln(`\x1b[33m${data.phase}\x1b[0m`)
+                    }
+                    break
+                case 'log_exit':
+                    if (data.job === tailingJob) {
+                        if (data.exit_code === 0) {
+                            term.writeln(`\x1b[32mexit 0\x1b[0m`)
+                        } else {
+                            term.writeln(`\x1b[31mexit ${data.exit_code}: ${data.reason}\x1b[0m`)
+                        }
+                    }
+                    break
+                case 'log_error':
+                    if (data.job === tailingJob) {
+                        term.writeln(`\x1b[31m${data.error}\x1b[0m`)
+                    }
+                    break
+                case 'dag_updated':
+                    loadDAG(data.namespace, data.slug)
+                    break
+                case 'run_completed':
+                case 'run_failed':
+                case 'run_cancelled':
+                case 'run_interrupted':
+                    status(`run ${data.status}`)
+                    break
+                }
+            }
+
+            ws.onerror = function () {
+                status('connection error')
+            }
+
+            ws.onclose = function () {
+                status('disconnected')
+            }
+        }
+
+        function startTailing(namespace, slug, job) {
+            tailingJob = job
+            term.clear()
+            term.writeln(`\x1b[33mtailing ${job}\x1b[0m`)
+            document.getElementById('info').textContent = `tailing: ${job}`
+            fetch(`/api/${namespace}/tail/${slug}/${job}`, { method: 'POST' })
+                .then(r => {
+                    if (!r.ok) return r.text().then(t => { throw new Error(t) })
+                    return r.json()
+                })
+                .then(data => {
+                    if (data.pod) {
+                        term.writeln(`\x1b[90mpod: ${data.pod}\x1b[0m`)
+                    }
+                })
+                .catch(err => {
+                    term.writeln(`\x1b[31m${err.message}\x1b[0m`)
+                })
+        }
+
+        async function loadDAG(namespace, slug) {
+            const resp = await fetch(`/api/${namespace}/dags/${slug}`)
+            if (!resp.ok) {
+                status(`no DAG found for ${namespace}/${slug}`)
+                return
+            }
+            const body = await resp.json()
+            const { nodes, edges } = buildGraph(body.dag, ['coalesce'])
+            createCytoscape([...nodes, ...edges])
+        }
+
+        async function loadRun(namespace, slug) {
+            const resp = await fetch(`/api/${namespace}/runs/${slug}`)
+            if (!resp.ok) return
+            const run = await resp.json()
+            applyRunState(run)
+            status(`${run.status} — ${run.jobs ? run.jobs.length : 0} jobs`)
+        }
+
+        document.getElementById('load').addEventListener('click', async function () {
+            const namespace = document.getElementById('namespace').value
+            const slug = document.getElementById('slug').value
+            if (!slug) return
+            status('loading...')
+            await loadDAG(namespace, slug)
+            await loadRun(namespace, slug)
+            connectWebSocket(namespace, slug)
+        })
+
+        // Auto-load if slug is in the URL
+        if (params.get('slug')) {
+            document.getElementById('load').click()
+        }
+    </script>
+</body>
+</html>

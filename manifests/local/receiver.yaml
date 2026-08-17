@@ -1,0 +1,104 @@
+# The receiver, deployed small: GitHub cannot reach a laptop and should not —
+# a signed payload from curl is byte-for-byte what a webhook is. The webhook
+# secret is not in this file; it is minted once, from a value that matters to
+# nobody:
+#
+#   kubectl --context orbstack -n coalesce create secret generic coalesce-webhook \
+#       --from-literal=secret=local-webhook-secret
+#
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coalesce-receiver
+  namespace: coalesce
+---
+# The informer watches claimed ConfigMaps; dispatch creates Jobs. Namespaced
+# Role and RoleBinding only — a ClusterRole would survive the namespace reset
+# by construction.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coalesce-receiver
+  namespace: coalesce
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coalesce-receiver
+  namespace: coalesce
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coalesce-receiver
+subjects:
+- kind: ServiceAccount
+  name: coalesce-receiver
+  namespace: coalesce
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coalesce-receiver
+  namespace: coalesce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coalesce-receiver
+  template:
+    metadata:
+      labels:
+        app: coalesce-receiver
+    spec:
+      serviceAccountName: coalesce-receiver
+      containers:
+      - name: coalesce-receiver
+        image: coalesce-receiver
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+        env:
+        - name: WEBHOOK_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: coalesce-webhook
+              key: secret
+        # The fictional proprietor of all example content. A repository claim
+        # outside this organization is rejected at the door.
+        - name: GITHUB_ORGANIZATION
+          value: amalgamated-widgets
+        # The code's own default is already coalesce; stated here so the
+        # manifest and the namespace visibly agree.
+        - name: JOB_NAMESPACE
+          value: coalesce
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coalesce-receiver
+  namespace: coalesce
+spec:
+  selector:
+    app: coalesce-receiver
+  ports:
+  - port: 80
+    targetPort: 8080

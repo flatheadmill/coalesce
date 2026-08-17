@@ -1,0 +1,55 @@
+apiVersion: coalesce.io/v1
+kind: Coalesce
+metadata:
+  name: pr-tests
+  namespace: default
+spec:
+  source: |
+    # Extract PR info from POST_BODY if present
+    if [[ -n "$POST_BODY" ]]; then
+      PR_NUMBER=$(echo "$POST_BODY" | jq -r '.pull_request.number // empty')
+      COMMIT_SHA=$(echo "$POST_BODY" | jq -r '.pull_request.head.sha // empty')
+    fi
+
+    step -n gather -- harbor.example.org/example/gather
+    step -n test -s -p
+    step -n unit-tests -u test -- harbor.example.org/example/test-unit
+    step -n integration-tests -u test -- harbor.example.org/example/test-integration
+    step -n lint -u test -- harbor.example.org/example/lint
+    step -n report -- harbor.example.org/example/test-report
+  timeout: 1800
+---
+apiVersion: coalesce.io/v1
+kind: Coalesce
+metadata:
+  name: issue-comment
+  namespace: default
+spec:
+  source: |
+    # Simple pipeline triggered by issue comments
+    COMMENT=$(echo "$POST_BODY" | jq -r '.comment.body // empty')
+
+    if [[ "$COMMENT" == *"@example nudge"* ]]; then
+      step -n reset-checks -- harbor.example.org/example/github-checks --reset
+    fi
+---
+apiVersion: coalesce.io/v1
+kind: Coalesce
+metadata:
+  name: nightly-build
+  namespace: default
+spec:
+  source: |
+    step -n checkout -- harbor.example.org/example/git-checkout
+    step -n build -- harbor.example.org/example/build
+    step -n test -- harbor.example.org/example/test
+    step -n package -- harbor.example.org/example/package
+    step -n publish -- harbor.example.org/example/publish
+  timeout: 7200
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"

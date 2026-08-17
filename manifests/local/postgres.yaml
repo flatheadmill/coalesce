@@ -1,0 +1,81 @@
+# PostgreSQL in-cluster, matching the production shape: the server finds its
+# database the same way in both worlds. Dev data is disposable — a namespace
+# reset costing the history costs nothing. The credentials match the server's
+# own code defaults and matter to nobody.
+#
+# The PVC rides the cluster's default StorageClass (local-path on OrbStack),
+# so the data survives pod replacement across rebuilds and dies with the
+# namespace, which is the intended reset.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: coalesce-postgres-data
+  namespace: coalesce
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+# strategy Recreate: a rolling update would point two postmasters at one data
+# directory. The pid-file lock makes the second crash-loop rather than corrupt,
+# but a crash-looping database mid-rebuild is a red herring in a loop that
+# exists to make rebuilds boring.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coalesce-postgres
+  namespace: coalesce
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: coalesce-postgres
+  template:
+    metadata:
+      labels:
+        app: coalesce-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:17
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        - name: POSTGRES_DB
+          value: coalesce
+        # A subdirectory of the mount, because initdb refuses a data directory
+        # that already contains the volume's own artifacts.
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres"]
+          initialDelaySeconds: 3
+          periodSeconds: 5
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: coalesce-postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coalesce-postgres
+  namespace: coalesce
+spec:
+  selector:
+    app: coalesce-postgres
+  ports:
+  - port: 5432
+    targetPort: 5432

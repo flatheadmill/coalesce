@@ -1,0 +1,104 @@
+#!/usr/bin/env zshctl
+
+zshctl[man_title]='Coalesce Manuals'
+
+typeset -ga _coalesce_children=()
+typeset -g _coalesce_run_started=0
+typeset -g _coalesce_run_status=
+
+# tini forwards the runner's TERM to Coalesce and its foreground children.
+# Install the handler before argument parsing or storage calls so Coalesce can
+# always record the interruption, including during the narrow startup window
+# before the run command has initialized.
+function _coalesce_stop_children {
+    typeset child
+    for child in "${(@)_coalesce_children}"; do
+        kill $child 2> /dev/null
+    done
+    for child in "${(@)_coalesce_children}"; do
+        wait $child 2> /dev/null
+    done
+    _coalesce_children=()
+}
+
+function TRAPTERM {
+    _coalesce_run_status=interrupted
+    _coalesce_stop_children
+    if (( _coalesce_run_started )) &&
+            (( ${+functions[_coalesce_finish_run]} )); then
+        _coalesce_finish_run
+    fi
+    exit 143
+}
+
+# CRC32 to lowercase hex for deterministic job name suffixes. The same slug
+# and path always produce the same hash, so re-running a pipeline with the
+# same slug recreates identical job names — the resume case. Padded to
+# eight digits: hex conversion drops leading zeros, which made the derived
+# name's length a function of the hash draw, and a name that only sometimes
+# clears the 63-character budget greys a check that should be red every
+# time or never.
+function _coalesce_cksum {
+    typeset -i16 hex_var=$(printf '%s' ${1:-} | cksum | cut -d' ' -f1)
+    print ${(l:8::0:)${hex_var[4,-1]:l}}
+}
+
+# The _coalesce associative array is the entire DAG state. Each node is a set
+# of compound keys like coalesce.fanout.baz:kind, coalesce.fanout.baz:queue,
+# coalesce.fanout.baz:over. The root node "coalesce" has parallel 1 because
+# top-level steps run serially — the pipeline is a sequence, parallelism
+# happens inside tranches.
+function _coalesce_init {
+    typeset -gA _coalesce=( coalesce:queue '' coalesce:over 0 coalesce:parallel 1 )
+    _coalesce_children=()
+}
+
+# The step function is the pipeline DSL. It runs at source time to build the
+# DAG before any jobs execute. Two kinds of nodes: a step with -p creates a
+# tranche (a sync point that groups children with a parallelism limit), a step
+# without -p creates a pod (an actual Kubernetes Job). The -u flag places a
+# node under a parent using slash notation that maps to dot-separated keys
+# internally. -p0 means unlimited parallelism (2^63-1 so the comparison logic
+# stays uniform), -p1 means serial, -pN means at most N concurrent children.
+function step {
+    eval "$(args n,name u,under p,parallel f,func -- "$@")"
+    typeset node pod split=() under=() join=( coalesce ) queue=()
+    if [[ -v o_under ]]; then
+        join=( coalesce "${(As:/:)o_under}" )
+    fi
+    under="${(j:.:)join}"
+    if [[ -v o_parallel ]]; then
+        (( ${+_coalesce[${under}:queue]} )) || abend "no such node to put under"
+        _coalesce[${under}.${o_name}:queue]=
+        queue=( "${(@AQ)${(z)_coalesce[${under}:queue]}}" )
+        queue+=( $o_name )
+        _coalesce[${under}:queue]="${(@qq)queue}"
+        _coalesce[${under}.${o_name}:kind]=tranche
+        _coalesce[${under}.${o_name}:started]=0
+        _coalesce[${under}.${o_name}:over]=0
+        if (( ! o_parallel )); then
+            _coalesce[${under}.${o_name}:parallel]=$((2**63 - 1))
+        else
+            _coalesce[${under}.${o_name}:parallel]=$o_parallel
+        fi
+    else
+        (( ${+_coalesce[${under}:queue]} )) || abend "no such node to put under"
+        typeset args=( "$@" )
+        eval "$(args e,env -- "$@")"
+        queue=( "${(@AQ)${(z)_coalesce[${under}:queue]}}" )
+        queue+=( $o_name )
+        _coalesce[${under}:queue]="${(@qq)queue}"
+        _coalesce[${under}.${o_name}:kind]=pod
+        _coalesce[${under}.${o_name}:args]=${(j: :)${(@qq)args}}
+    fi
+}
+
+function :args {
+    eval "$(args -UC -bx h,help -- "$@")"
+}
+
+function :execute {
+    delegate "$@"
+}
+
+# vim: ft=zsh :

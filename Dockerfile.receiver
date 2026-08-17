@@ -1,0 +1,20 @@
+# The receiver is the only part of Coalesce that faces the public internet, so
+# it ships as its own image rather than riding in the server's. One binary, one
+# entrypoint, nothing else in the filesystem to reach for: the recording server
+# and its HTML are not here, so a hole in the receiver cannot serve them.
+#
+# Build for amd64. The nodes are n2d and a workstation image will not run there.
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ ./cmd/
+RUN CGO_ENABLED=0 GOOS=linux go build -o coalesce-receiver ./cmd/receiver
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /app
+COPY --from=builder /build/coalesce-receiver .
+EXPOSE 8080
+ENTRYPOINT ["/app/coalesce-receiver"]

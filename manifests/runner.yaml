@@ -1,0 +1,38 @@
+# The identity a dispatched pipeline runs as. The receiver creates the runner
+# Job; the runner creates the step Jobs beneath it and watches them, which is
+# the whole of what it needs the API for.
+#
+# This file once also carried a pipeline ConfigMap and a hand-applied proof Job.
+# Both were the shape that preceded the bench — a pipeline pasted in as a data
+# key, and a Job written by hand to run it. The receiver builds that Job now and
+# `coalesce make` renders that ConfigMap, so what is left here is the identity,
+# which nothing else owns.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coalesce-runner
+  namespace: coalesce
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coalesce-runner
+  namespace: coalesce
+rules:
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create", "get", "list", "patch", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coalesce-runner
+  namespace: coalesce
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coalesce-runner
+subjects:
+- kind: ServiceAccount
+  name: coalesce-runner
+  namespace: coalesce

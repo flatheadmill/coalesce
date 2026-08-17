@@ -1,0 +1,7 @@
+# The local environment lives strictly in its own namespace on a shared
+# OrbStack cluster. A reset is deleting this namespace and re-applying —
+# never the cluster, which carries colleagues' running furniture.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: coalesce
