@@ -32,7 +32,7 @@ export function LogPage() {
   return (
     <>
       <h1 className="nameplate">
-        <Link to={`/${namespace}/runs`}>Kerchunkifier 3000</Link>
+        <Link to={`/${namespace}/runs`}>Coalesce</Link>
       </h1>
       <p className="crumb">
         <Link to={`/${namespace}/runs/${slug}`}>← {slug}</Link> · {job}
@@ -86,7 +86,7 @@ function RecordedLog({ log }: { log: string }) {
   const mount = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const figure = openTerminal(mount.current!);
+    const figure = openTerminal(mount.current!, log);
     figure.term.write(log);
     return figure.close;
   }, [log]);
@@ -94,7 +94,7 @@ function RecordedLog({ log }: { log: string }) {
   return <div className="terminal" ref={mount} />;
 }
 
-function openTerminal(mount: HTMLDivElement) {
+function openTerminal(mount: HTMLDivElement, recordedLog?: string) {
   const term = new Terminal({
     convertEol: true,
     disableStdin: true,
@@ -111,6 +111,9 @@ function openTerminal(mount: HTMLDivElement) {
   term.loadAddon(fit);
   term.open(mount);
   fit.fit();
+  if (recordedLog !== undefined) {
+    term.options.scrollback = estimatedRows(recordedLog, term.cols) + term.rows;
+  }
   const refit = () => fit.fit();
   window.addEventListener("resize", refit);
 
@@ -121,6 +124,20 @@ function openTerminal(mount: HTMLDivElement) {
       term.dispose();
     },
   };
+}
+
+function estimatedRows(log: string, columns: number) {
+  return log.split("\n").reduce((rows, line) => {
+    let cells = 0;
+    for (const character of line) {
+      if (character === "\t") {
+        cells += 8 - (cells % 8);
+      } else if (character !== "\r") {
+        cells += character.charCodeAt(0) > 0x7f ? 2 : 1;
+      }
+    }
+    return rows + Math.max(1, Math.ceil(cells / columns));
+  }, 0);
 }
 
 // The live terminal owns one log WebSocket. Its server handler writes each
