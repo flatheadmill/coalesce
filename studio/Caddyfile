@@ -1,0 +1,33 @@
+{
+  auto_https off
+}
+
+:80 {
+  @backend path /api/* /events/* /tail/*
+  handle @backend {
+    reverse_proxy {$COALESCE_UPSTREAM:http://coalesce.coalesce.svc.cluster.local}
+  }
+
+  @one host {$COALESCE_ONE_HOST:one.localhost}
+  handle @one {
+    root * /srv/one
+    try_files {path} /index.html
+    file_server
+  }
+
+  @two host {$COALESCE_TWO_HOST:two.localhost}
+  handle @two {
+    root * /srv/two
+    try_files {path} /index.html
+    file_server
+  }
+
+  @three host {$COALESCE_THREE_HOST:three.localhost}
+  handle @three {
+    root * /srv/three
+    try_files {path} /index.html
+    file_server
+  }
+
+  respond "No Coalesce studio exhibit is configured for this Host." 404
+}

@@ -1,0 +1,225 @@
+:root {
+  color: #252622;
+  background: #f2f1ed;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+a {
+  color: #315b4d;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+
+a:focus-visible,
+button:focus-visible,
+.output:focus-visible {
+  outline: 2px solid #315b4d;
+  outline-offset: 3px;
+}
+
+.shell {
+  width: min(100% - 2.5rem, 68rem);
+  margin-inline: auto;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding: 1.4rem 0;
+  border-bottom: 2px solid #343630;
+}
+
+.wordmark {
+  margin-right: 0.75rem;
+  color: inherit;
+  font-size: 1.05rem;
+  font-weight: 750;
+  text-decoration: none;
+}
+
+.studio-mark,
+.neutral-mark,
+.context {
+  color: #686a63;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+}
+
+main {
+  min-height: 78vh;
+  padding: 4rem 0 5rem;
+}
+
+h1 {
+  margin: 0.35rem 0 2rem;
+  font-size: clamp(2rem, 5vw, 3.2rem);
+  font-weight: 650;
+  letter-spacing: -0.035em;
+  line-height: 1;
+}
+
+.title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2rem;
+}
+
+button {
+  padding: 0.55rem 0.85rem;
+  border: 1px solid #7c7f76;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #e5e4de;
+}
+
+.pending,
+.failure,
+.blank {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-width: 44rem;
+  margin: 1.5rem 0;
+  padding: 1rem 0;
+  border-top: 1px solid #a9aba4;
+  border-bottom: 1px solid #a9aba4;
+}
+
+.pending,
+.blank span,
+.failure span {
+  color: #62655e;
+}
+
+.failure {
+  border-color: #9a514a;
+}
+
+.runs,
+.jobs {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid #b9bbb4;
+}
+
+.runs li,
+.jobs li {
+  display: grid;
+  grid-template-columns: 7rem minmax(12rem, 1fr) auto;
+  gap: 1rem;
+  align-items: baseline;
+  padding: 1rem 0;
+  border-bottom: 1px solid #cfd0cb;
+}
+
+.runs li > div,
+.jobs li > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.runs li > div span,
+.jobs li > div span,
+.runs time,
+.jobs li > span:last-child {
+  color: #6a6d65;
+  font-size: 0.83rem;
+}
+
+.run-state {
+  font-size: 0.8rem;
+  font-weight: 650;
+  text-transform: lowercase;
+}
+
+.return {
+  margin-bottom: 3rem;
+}
+
+.evidence-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 2.5rem;
+  border-top: 1px solid #b9bbb4;
+  border-bottom: 1px solid #b9bbb4;
+}
+
+.evidence-strip p {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 1rem 1rem 1rem 0;
+}
+
+.evidence-strip p + p {
+  padding-left: 1rem;
+  border-left: 1px solid #cfd0cb;
+}
+
+.evidence-strip span {
+  color: #6a6d65;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+
+.tail-note {
+  color: #62655e;
+}
+
+.output {
+  min-height: 20rem;
+  max-height: 65vh;
+  overflow: auto;
+  padding: 1.1rem;
+  border: 1px solid #3d403b;
+  background: #242824;
+  color: #edf0e8;
+  font: 0.85rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 42rem) {
+  header,
+  .title-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  main {
+    padding-top: 2.5rem;
+  }
+
+  .runs li,
+  .jobs li,
+  .evidence-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .evidence-strip p + p {
+    padding-left: 0;
+    border-left: 0;
+    border-top: 1px solid #cfd0cb;
+  }
+}
