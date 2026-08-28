@@ -32,7 +32,7 @@ export function LogPage() {
   return (
     <>
       <h1 className="nameplate">
-        <Link to={`/${namespace}/runs`}>Kerchunkifier 3000</Link>
+        <Link to={`/${namespace}/runs`}>Coalesce</Link>
       </h1>
       <p className="crumb">
         <Link to={`/${namespace}/runs/${slug}`}>← {slug}</Link> · {job}
@@ -79,7 +79,65 @@ function HarvestedLog({
   if (error) {
     return <Trouble error={error} />;
   }
-  return log !== undefined ? <pre className="log">{log}</pre> : null;
+  return log !== undefined ? <RecordedLog log={log} /> : null;
+}
+
+function RecordedLog({ log }: { log: string }) {
+  const mount = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const figure = openTerminal(mount.current!, log);
+    figure.term.write(log);
+    return figure.close;
+  }, [log]);
+
+  return <div className="terminal" ref={mount} />;
+}
+
+function openTerminal(mount: HTMLDivElement, recordedLog?: string) {
+  const term = new Terminal({
+    convertEol: true,
+    disableStdin: true,
+    fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+    fontSize: 13,
+    theme: {
+      background: "#171B21",
+      foreground: "#C9D3DD",
+      cursor: "#171B21",
+      selectionBackground: "#262D36",
+    },
+  });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  term.open(mount);
+  fit.fit();
+  if (recordedLog !== undefined) {
+    term.options.scrollback = estimatedRows(recordedLog, term.cols) + term.rows;
+  }
+  const refit = () => fit.fit();
+  window.addEventListener("resize", refit);
+
+  return {
+    term,
+    close: () => {
+      window.removeEventListener("resize", refit);
+      term.dispose();
+    },
+  };
+}
+
+function estimatedRows(log: string, columns: number) {
+  return log.split("\n").reduce((rows, line) => {
+    let cells = 0;
+    for (const character of line) {
+      if (character === "\t") {
+        cells += 8 - (cells % 8);
+      } else if (character !== "\r") {
+        cells += character.charCodeAt(0) > 0x7f ? 2 : 1;
+      }
+    }
+    return rows + Math.max(1, Math.ceil(cells / columns));
+  }, 0);
 }
 
 // The live terminal owns one log WebSocket. Its server handler writes each
@@ -97,28 +155,10 @@ function LiveLog({
   onExit: () => void;
 }) {
   const mount = useRef<HTMLDivElement>(null);
-  const terminal = useRef<Terminal | null>(null);
 
   useEffect(() => {
-    const term = new Terminal({
-      convertEol: true,
-      disableStdin: true,
-      fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
-      fontSize: 13,
-      theme: {
-        background: "#171B21",
-        foreground: "#C9D3DD",
-        cursor: "#171B21",
-        selectionBackground: "#262D36",
-      },
-    });
-    const fit = new FitAddon();
-    term.loadAddon(fit);
-    term.open(mount.current!);
-    fit.fit();
-    terminal.current = term;
-    const refit = () => fit.fit();
-    window.addEventListener("resize", refit);
+    const figure = openTerminal(mount.current!);
+    const { term } = figure;
 
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const path = `/tail/${namespace}/${slug}/${job}?container=${encodeURIComponent(containerOf(job))}`;
@@ -147,9 +187,7 @@ function LiveLog({
       socket.onmessage = null;
       socket.onerror = null;
       socket.close();
-      window.removeEventListener("resize", refit);
-      term.dispose();
-      terminal.current = null;
+      figure.close();
     };
   }, [namespace, slug, job]);
 
