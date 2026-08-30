@@ -25,6 +25,7 @@ function :args:make {
 # ConfigMap. COPYFILE_DISABLE keeps macOS extended attributes from arriving as
 # AppleDouble files.
 function :execute:make {
+    setopt localoptions pipefail
     typeset file separator= files=( "$@" )
     for file in "${(@)files}"; do
         [[ -e $file/coalesce.yaml ]] || abend 'not a coalesce directory'
