@@ -53,7 +53,7 @@ function :execute:make {
                 gzip -n |
                 base64 |
                 tr -d '\n'
-        )
+        ) || abend 'unable to archive `%s`' $file
         print
     done
 }
