@@ -1,15 +1,25 @@
 **Method**
 
-Exhibit two first establishes that it can move through the same specimen without inheriting exhibit one's interface. Its neutral scaffold owns a separate route tree, request state, event refresh, tail reader, markup, and stylesheet while depending on the one fixed transport.
+Exhibit two renders bounded claims rather than resolved state. Coalesce can say what the executor recorded, what the browser is observing, what the bucket now holds, and what never arrived; it cannot turn an absent closing write into cluster liveness or a latest-only lookup into attempt-specific evidence. The interface earns trust by making those limits structural instead of hiding them in fallback punctuation.
 
-The scaffold treats every server answer as evidence rather than decoration. Empty collections, missing records, malformed responses, connection failures, running jobs, completed jobs, and unharvested logs remain distinguishable in plain language.
+The collection is explicitly the latest one hundred records. A completed timestamp closes a record. Without it, the record is unclosed even if its stored status says running, and elapsed time frozen at the HTTP read is not described as live duration. Outcome, closure, and current observation remain separate facts. Search and filters may select the available window, but pipeline prose and slug punctuation do not become invented families or stable identities.
 
-No visual cut has been selected. The app is intentionally spare enough to reveal contract and navigation problems before a design method gives those facts hierarchy and form.
+Run detail is an ordered accumulation: opening, the latest stored declaration, each Job attempt, and closure when it exists. Attempts retain their timestamps and never fold into a synthetic step state. Missing exit codes say not recorded. The DAG is a semantic declaration of the nodes, parents, kinds, and nesting actually returned; no edge or dependency is drawn unless the payload contains it.
+
+Log detail names custody before content and resolves custody independently from Job closure. An open tail is a cluster observation made by this browser. A harvested log is the latest stored artifact addressable by run, Job, and container identity, and it may exist even while the Job row remains unclosed. Both accounts are shown when both exist. Because the current endpoint does not accept an attempt timestamp, the interface does not visually promise that a retrieved artifact belongs to a particular historical attempt. A live termination reason may be shown as an observation without pretending it entered the durable record.
+
+The visual system makes provenance glanceable without turning every uncertainty into a warning. Recorded facts use the ordinary structural ink, current observation has one cool signal, unavailable or unclosed facts have one amber signal, and failure alone spends red. Monospace identifies literal values and timestamps; a compact sans-serif register carries labels and explanations. Rules and alignment expose the chain of assertions while shapes and words keep color from carrying meaning alone.
+
+The design refuses inferred run kinship, inferred causes, invented graph edges, collapsed attempts, blank cells, and clocks that imply continued execution. Loading, an empty window, a missing record, a missing artifact, an HTTP answer, an invalid response shape, a failed connection, and a failed live tail each describe the boundary that was actually observed.
+
+Verification must test four risks: provenance language may slow failure triage; unclosed may read as evasion rather than precision; latest-only log retrieval may still appear attempt-specific; and an honest accumulation may become too dense for an operator. Judgment uses complete real-data journeys rather than isolated components, including narrow layouts and failed, incomplete, and unavailable states.
 
 **Sources**
 
-`cmd/web/main.go` supplies the HTTP responses, DAG envelope, state-event channel, and log-tail event vocabulary.
+`cmd/web/main.go` supplies the latest-one-hundred collection, consistent run-and-Job snapshot, latest DAG version, latest stored log lookup, advisory event channel, and live tail vocabulary.
 
-`ui/src/api.ts` supplies the product UI's grounded empty-list and container-name conventions.
+`studio/shared/api.ts` fixes the transport boundary, including empty-list normalization, response-shape failure, Job-leaf container convention, and the absence of attempt identity in log retrieval.
 
-`studio/brief.md` preserves the common assignment without becoming a shared presentation system.
+The Coalesce rationale establishes durable evidence as the product boundary. The database schema and server handlers preserve immutable Job attempts and versioned declarations rather than folding them into synthetic state.
+
+The production specimen read on August 30, 2026 supplied the contact: 100 recent runs spanning roughly 38 hours, 162 Job rows with no recorded exit code, five unclosed runs of which three had no open Job, and 100 flat DAGs containing one or two nodes. A current tail supplied direct log lines and a process-exit observation before the parent run acquired closure.
