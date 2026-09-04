@@ -13,6 +13,7 @@
   --line: #c4ceca;
   --line-strong: #8b9996;
   --recorded: #26383d;
+  --derived: #5d497f;
   --observed: #087181;
   --observed-wash: #dcedef;
   --unavailable: #8a5500;
@@ -72,6 +73,7 @@ h1, h2, h3, p { margin-top: 0; }
 h1 { margin-bottom: 0; font-size: clamp(3rem, 5vw, 4.8rem); line-height: 0.94; letter-spacing: -0.065em; font-weight: 800; }
 h2 { margin-bottom: 0; font-size: clamp(1.8rem, 3vw, 2.65rem); line-height: 1; letter-spacing: -0.045em; }
 h3 { margin-bottom: 0; font-size: 1.15rem; line-height: 1.15; letter-spacing: -0.02em; }
+h4 { margin: 0; font-size: 1rem; line-height: 1.2; letter-spacing: -0.015em; }
 .eyebrow {
   margin-bottom: 0.85rem; color: var(--muted); font-size: 0.68rem; font-weight: 800;
   letter-spacing: 0.12em; text-transform: uppercase;
@@ -85,6 +87,8 @@ h3 { margin-bottom: 0; font-size: 1.15rem; line-height: 1.15; letter-spacing: -0
 .claim i { display: inline-block; flex: none; width: 0.62rem; height: 0.62rem; background: currentColor; }
 .claim-observed { color: var(--observed); }
 .claim-observed i { border: 2px solid currentColor; border-radius: 50%; background: transparent; }
+.claim-derived { color: var(--derived); }
+.claim-derived i { border: 2px solid currentColor; background: transparent; transform: rotate(45deg); }
 .claim-unavailable { color: var(--unavailable); }
 .claim-unavailable i { width: 0.72rem; height: 2px; background: currentColor; }
 .claim-failed { color: var(--failed); }
@@ -227,11 +231,24 @@ tbody tr:last-child td { border-bottom: 0; }
 .dag-list li { list-style: none; }
 .dag-node { display: grid; grid-template-columns: 4rem minmax(0, 1fr) auto; align-items: center; gap: 1rem; min-height: 4rem; border-bottom: 1px solid var(--line); }
 .dag-order { color: var(--muted); font: 0.68rem var(--mono); }
-.dag-node > div { display: grid; gap: 0.1rem; }
-.dag-node strong { font-family: var(--mono); }
-.dag-node code { color: var(--muted); font-size: 0.68rem; }
+.dag-node > div { display: grid; min-width: 0; gap: 0.1rem; }
+.dag-node strong { overflow-wrap: anywhere; font-family: var(--mono); }
+.dag-node code { color: var(--muted); font-size: 0.68rem; overflow-wrap: anywhere; }
 .dag-kind { color: var(--muted); font-size: 0.63rem; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
 .dag-nested { margin: 0 0 0 2rem; border-top: 0; border-left: 1px solid var(--line-strong); }
+.declaration-record { margin-top: 1.8rem; }
+.declaration-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1.5rem; }
+.topology-panel { margin-top: 2.75rem; padding: 1.5rem; border: 1px solid var(--ink); border-top: 6px solid var(--derived); background: var(--paper); }
+.topology-heading { display: flex; align-items: end; justify-content: space-between; gap: 2rem; }
+.topology-heading .claim { margin-bottom: 0.65rem; }
+.topology-heading h4 { font-size: 1.35rem; }
+.topology-heading > p { margin: 0; color: var(--muted); font: 0.68rem var(--mono); text-align: right; }
+.topology-caption { max-width: 86ch; margin: 1.2rem 0 0; color: var(--ink-2); font-size: 0.78rem; }
+.topology-version { margin: 0.45rem 0 0; color: var(--muted); font-size: 0.68rem; }
+.topology-stage { position: relative; width: 100%; min-width: 0; max-width: 100%; height: var(--topology-height, 32rem); margin-top: 1.4rem; overflow-x: auto; overflow-y: hidden; border: 1px solid var(--line-strong); background: var(--paper-cool); }
+.topology-canvas { width: 100%; height: 100%; }
+.topology-state { position: absolute; inset: 0; display: grid; place-items: center; padding: 2rem; background: var(--paper-cool); color: var(--muted); text-align: center; }
+.topology-state-failed { color: var(--unavailable); }
 .sequence-open-end { border-bottom-color: var(--unavailable); }
 
 .log-title > .claim { justify-self: end; margin-top: 1.6rem; }
@@ -284,7 +301,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .head-inner, .page, .site-foot > div { width: min(100% - 1.5rem, 88rem); }
   .head-inner { grid-template-columns: 1fr auto; gap: 0.5rem 1rem; padding: 1rem 0; }
   .brand { align-items: flex-start; flex-direction: column; gap: 0.05rem; }
-  .claim-key { gap: 0.75rem; overflow-x: auto; }
+  .claim-key { flex-wrap: wrap; gap: 0.5rem 0.75rem; overflow-x: visible; }
+  .claim-key .claim { font-size: 0.58rem; }
   .claim-key > span:not(.claim) { display: none; }
   .page { padding-top: 3rem; }
   h1 { font-size: 3.1rem; }
@@ -313,6 +331,11 @@ tbody tr:last-child td { border-bottom: 0; }
   .sequence-marker { grid-column: 1; grid-row: 1; }
   .event-body { grid-column: 2; }
   .event-title-line { flex-direction: column; gap: 1rem; }
+  .declaration-heading, .topology-heading { align-items: flex-start; flex-direction: column; gap: 0.7rem; }
+  .topology-heading > p { text-align: left; }
+  .topology-panel { padding: 1rem; }
+  .topology-stage { height: var(--topology-height, 30rem); }
+  .topology-canvas { min-width: 80rem; }
   .evidence-address, .attempt-boundary, .observed-exit, .job-account { grid-template-columns: 1fr; gap: 0.5rem; }
   .observed-exit .text-action { justify-self: start; }
   .dag-node { grid-template-columns: 3rem minmax(0, 1fr); padding: 0.7rem 0; }

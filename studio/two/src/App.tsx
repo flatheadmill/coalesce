@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { Link, Navigate, Route, Routes, useParams } from "react-router-dom";
+import type { Core, ElementDefinition, StylesheetJson } from "cytoscape";
 import {
   ApiError, ShapeError, containerOf, fetchDag, fetchLog, fetchRun, fetchRuns,
   openLogTail, openRunEvents, parseStreamEvent,
   type DagNode, type DagResponse, type Job, type Run, type RunDetail,
 } from "../../shared/api";
+import { buildPrecedenceTopology } from "./topology";
 
 interface Remote<T> { data?: T; error?: unknown; loading: boolean; updatedAt?: number }
 
@@ -76,7 +78,7 @@ function span(started: string, ended: string | number): string {
 }
 
 const cssStatus = (value: string) => value.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
-type ClaimKind = "recorded" | "observed" | "unavailable" | "failed";
+type ClaimKind = "recorded" | "derived" | "observed" | "unavailable" | "failed";
 
 function Claim({ kind, children }: { kind: ClaimKind; children: ReactNode }) {
   return <span className={`claim claim-${kind}`}><i aria-hidden="true" />{children}</span>;
@@ -279,6 +281,132 @@ function DagList({ nodes, prefix = "" }: { nodes: DagNode[]; prefix?: string }) 
   </ol>;
 }
 
+function DagGraph({ nodes, createdAt }: { nodes: DagNode[]; createdAt: string }) {
+  const container = useRef<HTMLDivElement>(null);
+  const stageContainer = useRef<HTMLDivElement>(null);
+  const [state, setState] = useState<"loading" | "ready" | "failed">("loading");
+  const topology = useMemo(() => buildPrecedenceTopology(nodes), [createdAt]);
+  const graphHeight = Math.max(18, Math.min(44, 13 + (Math.max(0, ...topology.jobs.map((job) => job.rank)) + 1) * 5));
+  const positions = useMemo(() => {
+    const layers = new Map<number, typeof topology.jobs>();
+    for (const job of topology.jobs) layers.set(job.rank, [...(layers.get(job.rank) ?? []), job]);
+    const predecessors = new Map<string, string[]>();
+    for (const relation of topology.relations) predecessors.set(relation.target, [...(predecessors.get(relation.target) ?? []), relation.source]);
+    const unitX = new Map<string, number>();
+    const maximumLayer = Math.max(1, ...[...layers.values()].map((layer) => layer.length));
+    const width = Math.max(760, maximumLayer * 150);
+    for (const [, layer] of [...layers.entries()].sort(([a], [b]) => a - b)) {
+      const ordered = [...layer].sort((a, b) => a.order - b.order);
+      ordered.forEach((job, index) => {
+        const incoming = predecessors.get(job.id) ?? [];
+        const predecessorPositions = incoming.map((id) => unitX.get(id)).filter((value): value is number => value !== undefined);
+        const distributed = ordered.length === 1 ? 0.5 : (index + 0.5) / ordered.length;
+        unitX.set(job.id, ordered.length === 1 || incoming.length > 1
+          ? predecessorPositions.length ? predecessorPositions.reduce((sum, value) => sum + value, 0) / predecessorPositions.length : distributed
+          : distributed);
+      });
+    }
+    return new Map(topology.jobs.map((job) => [job.id, { x: 70 + (unitX.get(job.id) ?? 0.5) * width, y: 70 + job.rank * 104 }]));
+  }, [topology]);
+
+  useEffect(() => {
+    let active = true;
+    let graph: Core | undefined;
+    let observer: ResizeObserver | undefined;
+    let frame = 0;
+    setState("loading");
+
+    void import("cytoscape").then(({ default: cytoscape }) => {
+      if (!active || !container.current) return;
+      const elements: ElementDefinition[] = [
+        ...topology.jobs.map((job) => ({
+          data: { id: job.id, label: job.label, order: job.order },
+          classes: "topology-job",
+        })),
+        ...topology.relations.map((relation) => ({
+          data: { id: relation.id, source: relation.source, target: relation.target },
+          classes: "precedence-relation",
+        })),
+      ];
+      const style: StylesheetJson = [
+        {
+          selector: "node.topology-job",
+          style: {
+            "background-color": "#fbfcf9", "border-color": "#26383d", "border-width": 2,
+            color: "#152024", label: "data(label)", shape: "round-rectangle", width: 132, height: 48,
+            "font-family": "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", "font-size": 11,
+            "font-weight": 700, "text-halign": "center", "text-valign": "center",
+            "text-max-width": "116px", "text-wrap": "wrap",
+          },
+        },
+        {
+          selector: "edge.precedence-relation",
+          style: {
+            width: 1.5, "line-color": "#59676b", "target-arrow-color": "#59676b",
+            "target-arrow-shape": "triangle", "arrow-scale": 0.8, "curve-style": "taxi",
+            "taxi-direction": "downward", "taxi-turn": 24, "taxi-turn-min-distance": 8,
+          },
+        },
+      ];
+      graph = cytoscape({
+        container: container.current,
+        elements,
+        style,
+        layout: { name: "preset", positions: Object.fromEntries(positions), fit: true, padding: 30 },
+        autoungrabify: true,
+        autounselectify: true,
+        boxSelectionEnabled: false,
+        userPanningEnabled: false,
+        userZoomingEnabled: false,
+      });
+      const refit = () => {
+        window.cancelAnimationFrame(frame);
+        frame = window.requestAnimationFrame(() => {
+          graph?.resize();
+          graph?.fit(graph.elements(), 30);
+        });
+      };
+      observer = new ResizeObserver(refit);
+      observer.observe(container.current);
+      refit();
+      setState("ready");
+    }).catch(() => {
+      if (active) setState("failed");
+    });
+
+    return () => {
+      active = false;
+      window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+      graph?.destroy();
+    };
+  }, [topology]);
+
+  useEffect(() => {
+    if (state !== "ready") return;
+    const timer = window.setTimeout(() => {
+      const stage = stageContainer.current;
+      if (stage && stage.scrollWidth > stage.clientWidth) {
+        stage.scrollLeft = (stage.scrollWidth - stage.clientWidth) / 2;
+      }
+    }, 100);
+    return () => window.clearTimeout(timer);
+  }, [state, topology]);
+
+  return <section className="topology-panel" aria-labelledby="topology-title">
+    <header className="topology-heading"><div><Claim kind="derived">Derived view</Claim><h4 id="topology-title">Inferred Job precedence</h4></div>
+      <p><strong>{topology.jobs.length}</strong> {topology.jobs.length === 1 ? "Job identity" : "Job identities"} · <strong>{topology.relations.length}</strong> inferred precedence {topology.relations.length === 1 ? "relation" : "relations"}</p>
+    </header>
+    <p className="topology-caption">Each arrow means only that its source Job must precede its target Job under the recorded ordered/parallel tranche semantics. It is not observed timing, an execution trace, or dataflow. Parallel permits fan-out; it does not prove simultaneity.</p>
+    <p className="topology-version">Derived from the declaration recorded <time dateTime={createdAt}>{fullTime(createdAt)}</time>.</p>
+    <div ref={stageContainer} className="topology-stage" style={{ "--topology-height": `${graphHeight}rem` } as CSSProperties}>
+      <div ref={container} className="topology-canvas" aria-hidden="true" />
+      {state === "loading" ? <div className="topology-state" role="status">Drawing the inferred precedence view…</div> : null}
+      {state === "failed" ? <div className="topology-state topology-state-failed" role="status">The inferred drawing is unavailable. The recorded declaration remains above.</div> : null}
+    </div>
+  </section>;
+}
+
 type SequenceEvent =
   | { kind: "opened"; at: string }
   | { kind: "declaration"; at: string; dag: DagResponse }
@@ -318,8 +446,10 @@ function SequenceItem({ event, namespace, slug, now, runStatus }: {
   </li>;
   if (event.kind === "declaration") return <li className="sequence-item event-recorded">
     <i className="sequence-marker" aria-hidden="true" /><time dateTime={event.at}>{fullTime(event.at)}</time>
-    <div className="event-body"><Claim kind="recorded">Latest declaration</Claim><h3>{dagCount(event.dag.dag)} declared {dagCount(event.dag.dag) === 1 ? "node" : "nodes"}</h3>
-      <p>The endpoint returns the newest stored DAG version. Names, parents, kinds, and nesting are preserved below; no edges are inferred.</p><DagList nodes={event.dag.dag} />
+    <div className="event-body"><Claim kind="recorded">Latest declaration</Claim><h3>{dagCount(event.dag.dag)} declared {dagCount(event.dag.dag) === 1 ? "object" : "objects"}</h3>
+      <p>The endpoint returns the newest stored DAG version. It records names, parents, kinds, and nesting—not literal edges.</p>
+      <section className="declaration-record" aria-labelledby="declaration-record-title"><div className="declaration-heading"><Claim kind="recorded">Recorded declaration</Claim><h4 id="declaration-record-title">Nested objects as returned</h4></div><DagList nodes={event.dag.dag} /></section>
+      <DagGraph nodes={event.dag.dag} createdAt={event.dag.created_at} />
     </div>
   </li>;
   if (event.kind === "closed") return <li className={`sequence-item event-${runStatus === "failed" ? "failed" : "recorded"}`}>

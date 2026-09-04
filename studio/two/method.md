@@ -4,7 +4,7 @@ Exhibit two renders bounded claims rather than resolved state. Coalesce can say 
 
 The collection is explicitly the latest one hundred records. A completed timestamp closes a record. Without it, the record is unclosed even if its stored status says running, and elapsed time frozen at the HTTP read is not described as live duration. Outcome, closure, and current observation remain separate facts. Search and filters may select the available window, but pipeline prose and slug punctuation do not become invented families or stable identities.
 
-Run detail is an ordered accumulation: opening, the latest stored declaration, each Job attempt, and closure when it exists. Attempts retain their timestamps and never fold into a synthetic step state. Missing exit codes say not recorded. The DAG is a semantic declaration of the nodes, parents, kinds, and nesting actually returned; no edge or dependency is drawn unless the payload contains it.
+Run detail is an ordered accumulation: opening, the latest stored declaration, each Job attempt, and closure when it exists. Attempts retain their timestamps and never fold into a synthetic step state. Missing exit codes say not recorded. The DAG remains an always-visible semantic declaration of the objects, parents, kinds, and nesting actually returned, and that list is the sole tranche/nesting account. A sibling Job-only graph may derive Job-to-Job precedence from recorded ordered/parallel tranche semantics, but it must mark every relation as inferred: an arrow is neither observed timing, an execution trace, dataflow, nor proof that permitted parallel work ran simultaneously.
 
 Log detail names custody before content and resolves custody independently from Job closure. An open tail is a cluster observation made by this browser. A harvested log is the latest stored artifact addressable by run, Job, and container identity, and it may exist even while the Job row remains unclosed. Both accounts are shown when both exist. Because the current endpoint does not accept an attempt timestamp, the interface does not visually promise that a retrieved artifact belongs to a particular historical attempt. A live termination reason may be shown as an observation without pretending it entered the durable record.
 
@@ -16,7 +16,7 @@ Verification must test four risks: provenance language may slow failure triage; 
 
 **Sources**
 
-`cmd/web/main.go` supplies the latest-one-hundred collection, consistent run-and-Job snapshot, latest DAG version, latest stored log lookup, advisory event channel, and live tail vocabulary.
+`cmd/web/main.go` supplies the latest-one-hundred collection, consistent run-and-Job snapshot, latest DAG version, latest stored log lookup, advisory event channel, and live tail vocabulary. The historical `run.html` supplies a prior serial/parallel traversal for comparison, while the locally installed Cytoscape package supplies rendering only; Exhibit Two owns and labels its precedence derivation.
 
 `studio/shared/api.ts` fixes the transport boundary, including empty-list normalization, response-shape failure, Job-leaf container convention, and the absence of attempt identity in log retrieval.
 
