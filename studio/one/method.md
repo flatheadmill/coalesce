@@ -16,7 +16,7 @@ The operator is treated as someone who already understands Kubernetes. Navigatio
 
 `cmd/web/main.go` defines the immutable facts available to the exhibit: run identity, job attempts, current DAG, stored logs, and advisory streams.
 
-`ui/src` demonstrates the current product's useful custody distinction between living work and the settled ledger without binding this exhibit to its presentation.
+The former product in `ui/src` (preserved in Git history) demonstrated a useful custody distinction between living work and the settled ledger without binding this exhibit to its presentation.
 
 The Coalesce rationale establishes the reader as a cluster operator seeking proof rather than another pipeline platform, while levels 012 and 013 place logs, deposited pages, versioned DAGs, and reused pod evidence on one future continuum.
 
