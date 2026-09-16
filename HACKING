@@ -103,23 +103,36 @@ no port-forward:
     curl http://coalesce.coalesce.svc.cluster.local/health
 
 The same address works from curl, the browser, and any process on the Mac.
-The run table is served at the root — the UI rides embedded in the server
-image, built by the Dockerfile's node stage, so deploying the server deploys
-the UI:
+Two is served at the root — the UI rides embedded in the server image,
+built from studio/two by the Dockerfile's node stage, so deploying the server
+deploys the UI:
 
     http://coalesce.coalesce.svc.cluster.local/coalesce/runs
 
 The old prototype remains at /run.html until its role is fully retired. For
-UI development the loop is Vite on the Mac, proxying /api and /events to the
-cluster:
+UI development the loop uses the same studio/two source with Vite on the
+Mac, proxying /api, /events, and /tail to the cluster. With Node 22.12 or newer,
+run from the repository root:
 
-    cd ui && npm install && npm run dev
+    npm ci --prefix studio
+    npm run dev:two --prefix studio
+
+Open http://localhost:5172/coalesce/runs. Set COALESCE_DEV_UPSTREAM to use a
+different backend. The other exhibits and the separate studio container
+remain available; studio/README.md describes them.
 
 A bare `go build ./cmd/web` always compiles — a tracked placeholder satisfies
 the embed on a clean clone — but a binary built that way serves a plain-text
-notice at the root instead of the app. To embed the app in a bare build, run
-`(cd ui && npm run build)` first. The docker build runs both stages itself
-and is the path that ships.
+notice at the root instead of the app. To embed Two in a bare build after
+installing the studio dependencies, build it and copy its output into the
+embed directory, removing previous assets while keeping the placeholder:
+
+    npm run build:two --prefix studio
+    find cmd/web/dist -mindepth 1 ! -name .gitkeep -delete
+    cp -R studio/dist/two/. cmd/web/dist/
+    go build ./cmd/web
+
+The Docker build runs both stages itself and is the path that ships.
 
 ---
 
@@ -245,13 +258,14 @@ template shows the shape.
 
 Log Tailing
 
-The server tails logs from running pods via the Kubernetes API:
+The UI opens a dedicated WebSocket to tail pod logs through the server:
 
-    curl -X POST http://coalesce.coalesce.svc.cluster.local/api/coalesce/tail/{slug}/{job}
+    /tail/{namespace}/{slug}/{job}?container={container}
 
 The server finds the pod by label selector, waits for it to leave Pending,
-and streams lines through the EventHub as log_line events. WebSocket
-subscribers on /events/coalesce/{slug} receive them in real time.
+and sends log_line events directly to that socket. Run state notifications
+use the separate /events/{namespace}/{slug} WebSocket. Vite and the studio
+container proxy both paths; the server image handles them directly.
 
 ---
 
@@ -293,7 +307,8 @@ Layout
     cmd/receiver/                   Webhook receiver
     run.html                        Old UI prototype (served at /run.html)
     test/                           Pipeline test definitions
-    ui/                             The run table (Vite, React, TypeScript)
+    studio/two/                     Product UI (Vite, React, TypeScript)
+    studio/                         UI package, shared transport, and exhibits
     manifests/local/                The local environment (this file's subject)
     manifests/                      Older manifests, kept beside
     Dockerfile                      Server image

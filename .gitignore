@@ -1,5 +1,4 @@
 /web
-ui/node_modules
 studio/node_modules
 studio/dist
 cmd/web/dist/*

@@ -1,5 +1,4 @@
 .git
 studio/node_modules
 studio/dist
-ui/node_modules
 cmd/web/dist

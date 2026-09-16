@@ -54,10 +54,10 @@ var (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-// The UI rides in the binary — built output embedded and versioned with the
-// server, per the settled asset contract. Built by the Dockerfile's node
-// stage into cmd/web/dist; a bare `go build ./cmd/web` needs
-// `(cd ui && npm run build)` first.
+// Two rides in the binary, embedded and versioned with the server. The
+// Dockerfile builds studio/two with build:two and copies studio/dist/two
+// into cmd/web/dist. A bare `go build ./cmd/web` compiles with the tracked
+// placeholder; follow HACKING to include the app in a local Go build.
 //
 //go:embed all:dist
 var dist embed.FS
@@ -1102,13 +1102,13 @@ func main() {
 	uiBuilt := uiBuiltErr == nil
 	if !uiBuilt {
 		slog.Warn("UI not embedded in this binary; / serves a notice",
-			"fix", "(cd ui && npm run build) and rebuild, or use docker build")
+			"fix", "follow HACKING to build and copy studio/two before rebuilding, or use docker build")
 	}
 	uiFiles := http.FileServer(http.FS(ui))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if !uiBuilt {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			fmt.Fprintln(w, "This binary was built without the UI. Run (cd ui && npm run build) and rebuild, or use docker build, which builds both.")
+			fmt.Fprintln(w, "This binary was built without the UI. Follow HACKING to build and copy studio/two before rebuilding, or use docker build, which builds both.")
 			return
 		}
 		path := strings.TrimPrefix(r.URL.Path, "/")

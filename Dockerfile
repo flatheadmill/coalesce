@@ -1,13 +1,13 @@
-# The server image carries the UI: the node stage builds ui/ into the
-# location cmd/web's go:embed expects, so the built output is embedded and
-# versioned with the server — one image, one artifact, no separate deploy.
+# The server image carries Two: the node stage builds studio/two, then its
+# output is copied where cmd/web's go:embed expects it — one image, one
+# artifact, with the same UI source used by the local Vite loop.
 FROM node:22-alpine AS ui
 
-WORKDIR /build/ui
-COPY ui/package.json ui/package-lock.json ./
+WORKDIR /build/studio
+COPY studio/package.json studio/package-lock.json ./
 RUN npm ci --no-fund --no-audit
-COPY ui/ ./
-RUN npm run build
+COPY studio/ ./
+RUN npm run build:two
 
 FROM golang:1.24-alpine AS builder
 
@@ -15,7 +15,7 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ ./cmd/
-COPY --from=ui /build/cmd/web/dist ./cmd/web/dist
+COPY --from=ui /build/studio/dist/two ./cmd/web/dist
 RUN CGO_ENABLED=0 GOOS=linux go build -o coalesce ./cmd/web
 
 FROM alpine:latest

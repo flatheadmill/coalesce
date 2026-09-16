@@ -11,6 +11,10 @@ resetting. Its commands carry the kubectl context and environment guards on
 purpose; on a machine whose default context is a real cluster, an unguarded
 command is aimed at production. Copy commands from HACKING, not from memory.
 
+The server image builds and embeds Two from `studio/two`. The same source
+runs under Vite for local UI development; there is no separate production
+copy. `studio/README.md` describes the exhibits and their separate container.
+
 ---
 
 Layout
@@ -21,7 +25,8 @@ share/coalesce/commands/        Executor commands (run/command.zsh is the event 
 cmd/web/main.go                 Go server
 cmd/web/migrations/             Database schema
 cmd/receiver/                   Webhook receiver
-ui/                             The run table (Vite, React, TypeScript)
+studio/two/                     Product UI (Vite, React, TypeScript)
+studio/                         UI package, shared transport, and exhibits
 run.html                        Old UI prototype (served at /run.html)
 test/                           Pipeline test definitions
 manifests/local/                The local environment
