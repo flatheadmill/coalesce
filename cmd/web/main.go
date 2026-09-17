@@ -767,6 +767,28 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// selectTailPod chooses a current observation, not an attempt match. The
+// executor's labels identify the run and Job but contain no attempt marker.
+// Prefer the newest nonterminal Pod, then the newest terminal Pod. Names
+// break equal creation timestamps so Kubernetes list order never decides.
+func selectTailPod(pods []corev1.Pod) *corev1.Pod {
+	var selected *corev1.Pod
+	nonterminal := func(pod *corev1.Pod) bool {
+		return pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed
+	}
+	for i := range pods {
+		pod := &pods[i]
+		if selected == nil ||
+			(nonterminal(pod) && !nonterminal(selected)) ||
+			(nonterminal(pod) == nonterminal(selected) &&
+				(pod.CreationTimestamp.After(selected.CreationTimestamp.Time) ||
+					(pod.CreationTimestamp.Equal(&selected.CreationTimestamp) && pod.Name < selected.Name))) {
+			selected = pod
+		}
+	}
+	return selected
+}
+
 // A log tail is one Kubernetes stream written directly to one WebSocket. The
 // read and write stay in the same loop so a full socket stops the Kubernetes
 // reader instead of turning log content into lossy broadcast events.
@@ -786,12 +808,12 @@ func handleTailLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(pods.Items) == 0 {
+	pod := selectTailPod(pods.Items)
+	if pod == nil {
 		http.Error(w, "No pod found for job", http.StatusNotFound)
 		return
 	}
 
-	pod := &pods.Items[0]
 	podName := pod.Name
 
 	// Default to first container if not specified.
