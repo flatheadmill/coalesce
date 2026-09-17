@@ -268,6 +268,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .output-wait { padding: 1.2rem 1.4rem; border: 1px solid var(--line-strong); background: var(--paper); }
 .output-wait > p { margin-bottom: 0.75rem; }
 .output-wait .tail-account { color: var(--muted); font-size: 0.78rem; }
+.pending-output { padding: 1rem 1.4rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.78rem; }
+.pending-output p { margin: 0; }
+.pending-output p + p { margin-top: 0.35rem; }
 .output-details { margin-top: 3rem; }
 .output-details h2 { margin-bottom: 1rem; font-size: 1.4rem; }
 .output-details > p { max-width: 80ch; margin-bottom: 1rem; color: var(--muted); font-size: 0.78rem; }

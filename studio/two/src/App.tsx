@@ -2,15 +2,16 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSPrope
 import { Link, Navigate, Route, Routes, useParams } from "react-router-dom";
 import type { Core, ElementDefinition, StylesheetJson } from "cytoscape";
 import {
-  ApiError, ShapeError, containerOf, fetchDag, fetchLog, fetchRun, fetchRuns,
+  ApiError, ShapeError, containerOf, fetchDag, fetchRun, fetchRuns,
   openLogTail, openRunEvents, parseStreamEvent,
   type DagNode, type DagResponse, type Job, type Run, type RunDetail,
 } from "../../shared/api";
 import { buildPrecedenceTopology } from "./topology";
+import { useStoredOutput, type StoredOutput } from "./useStoredOutput";
 
 interface Remote<T> { data?: T; error?: unknown; loading: boolean; updatedAt?: number }
 
-function useRemote<T>(identity: string, read: () => Promise<T>, poll = 0):
+function useRemote<T>(identity: string, read: () => Promise<T>, poll = 0, retain = false):
   Remote<T> & { reload: () => void } {
   const readRef = useRef(read);
   readRef.current = read;
@@ -19,13 +20,18 @@ function useRemote<T>(identity: string, read: () => Promise<T>, poll = 0):
   const reload = useCallback(() => setRevision((value) => value + 1), []);
   useEffect(() => {
     let current = true;
+    let reading = false;
     const load = async (initial: boolean) => {
-      if (initial) setRemote({ loading: true });
+      if (reading) return;
+      reading = true;
+      if (initial) setRemote((previous) => retain ? { ...previous, loading: previous.data === undefined } : { loading: true });
       try {
         const data = await readRef.current();
         if (current) setRemote({ data, loading: false, updatedAt: Date.now() });
       } catch (error) {
-        if (current) setRemote({ error, loading: false, updatedAt: Date.now() });
+        if (current) setRemote((previous) => retain ? { ...previous, error, loading: false } : { error, loading: false, updatedAt: Date.now() });
+      } finally {
+        reading = false;
       }
     };
     void load(true);
@@ -34,7 +40,7 @@ function useRemote<T>(identity: string, read: () => Promise<T>, poll = 0):
       current = false;
       if (timer !== undefined) window.clearInterval(timer);
     };
-  }, [identity, poll, revision]);
+  }, [identity, poll, revision, retain]);
   return { ...remote, reload };
 }
 
@@ -601,28 +607,35 @@ function LogSurface({ text, label, caption, annotation, startAtEnd = false }: {
   </div>;
 }
 
-function StoredLog({ log, job, attempts, primary }: {
-  log: Remote<string> & { reload: () => void }; job: string; attempts: Job[]; primary: boolean;
+function StoredLog({ log, job, attempts, primary, beganUnclosed }: {
+  log: StoredOutput; job: string; attempts: Job[]; primary: boolean; beganUnclosed: boolean;
 }) {
   const latest = attempts.at(-1);
   if (log.loading) return <Loading>Reading stored output…</Loading>;
-  if (log.error instanceof ApiError && log.error.status === 404) return <section className="notice artifact-missing" role="status">
-    <Claim kind="unavailable">Stored output unavailable</Claim><h2>No stored output was found.</h2>
-    <p>The server returned 404 for this Job and container. Output may still be collected later.</p>
-    <button className="text-action" type="button" onClick={log.reload}>Check again</button>
-  </section>;
-  if (log.error) return <div className="output-problem"><p className="eyebrow">Stored output unavailable</p><Problem error={log.error} retry={log.reload} /></div>;
-  return <LogSurface text={log.data ?? ""} label="Stored output" caption={attempts.length > 1 ? `${attempts.length} attempts · output attempt unspecified` : "Latest stored response"} startAtEnd={primary && latest?.status === "failed"} annotation={<>
-    <p>Container <code>{containerOf(job)}</code>, from the Job name. Latest stored output; its attempt is unspecified.</p>
-    {attempts.length > 1 ? <p>{attempts.length} attempts share this address. Output cannot be selected or attributed by attempt.</p> : null}
+  if (log.data === undefined && log.error instanceof ApiError && log.error.status === 404) {
+    if (log.polling) return <section className="pending-output" role="status">
+      <p>Stored output is pending.</p><p>{latest && !latest.completed_at ? "Checking while this attempt is unclosed." : "Checking briefly after completion for harvested output."}</p>
+    </section>;
+    return <section className="notice artifact-missing" role="status">
+      <Claim kind="unavailable">Stored output unavailable</Claim><h2>No stored output was found.</h2>
+      <p>The server returned 404 for this Job and container.</p>
+      <button className="text-action" type="button" onClick={log.reload}>Check again</button>
+    </section>;
+  }
+  if (log.data === undefined && log.error) return <div className="output-problem"><p className="eyebrow">Stored output unavailable</p><Problem error={log.error} retry={log.reload} /></div>;
+  const attribution = attempts.length === 1 ? "Stored output for the only recorded attempt." : attempts.length > 1 ? "Latest stored output; it may belong to an earlier attempt." : "No matching Job attempt was returned with which to associate this output.";
+  return <LogSurface text={log.data ?? ""} label="Stored output" caption={attempts.length > 1 ? `${attempts.length} attempts · latest stored output, attempt unspecified` : "Latest stored response"} startAtEnd={primary && !beganUnclosed && latest?.status === "failed"} annotation={<>
+    <p>Container <code>{containerOf(job)}</code>, from the Job name. {attribution}</p>
+    {attempts.length > 1 ? <p>Output cannot be selected or attributed by attempt.</p> : null}
     {latest && !latest.completed_at ? <p>Job completion is not recorded. Stored output does not establish whether a process is still running.</p> : null}
+    {log.error ? <p>The latest refresh failed; the last received output remains above. <button className="text-action" type="button" onClick={log.reload}>Check again</button></p> : null}
   </>} />;
 }
 
 interface TailObservation { exitCode?: string; reason?: string; observedAt: number; text: string }
 type TailState = "connecting" | "observed" | "error" | "exited" | "closed";
 
-function StreamingLog({ namespace, slug, job, finished }: RouteIdentity & { finished: (value: TailObservation) => void }) {
+function StreamingLog({ namespace, slug, job, finished, canReconnect }: RouteIdentity & { finished: (value: TailObservation) => void; canReconnect: boolean }) {
   const [lines, setLines] = useState<string[]>([]);
   const linesRef = useRef<string[]>([]);
   const [state, setState] = useState<TailState>("connecting");
@@ -663,7 +676,7 @@ function StreamingLog({ namespace, slug, job, finished }: RouteIdentity & { fini
   const output = lines.length ? `${lines.join("\n")}\n` : "";
   const account = <div className={`tail-account tail-${state}`} aria-live="polite">
     <p>Observed in this tab. Container <code>{containerOf(job)}</code> is taken from the Job name; the server selects a Pod without returning its name or identifying an attempt.</p>
-    {state === "error" || state === "closed" ? <button className="text-action" type="button" onClick={() => setRevision((value) => value + 1)}>Reconnect</button> : null}
+    {canReconnect && (state === "error" || state === "closed") ? <button className="text-action" type="button" onClick={() => setRevision((value) => value + 1)}>Reconnect</button> : null}
   </div>;
   return output ? <LogSurface text={output} label="Observed Pod output" caption={note} annotation={account} /> : <section className="output-wait">
     <p className="eyebrow">Pod output</p><p role="status">{state === "error" || state === "closed" ? "No output was received from this connection." : "Waiting for output…"}</p><p aria-live="polite">{note}</p>{account}
@@ -678,18 +691,20 @@ function EndedObservation({ value, primary, again }: { value: TailObservation; p
   </div>} />;
 }
 
-function LogRoute() {
-  const { namespace = "coalesce", slug = "", job = "" } = useParams();
-  const run = useRemote(`log-run:${namespace}:${slug}`, () => fetchRun(namespace, slug), 5_000);
-  const stored = useRemote(`stored:${namespace}:${slug}:${job}`, () => fetchLog(namespace, slug, job, containerOf(job)));
-  const observationKey = `coalesce:tail:${namespace}:${slug}:${job}`;
-  const [observation, setObservation] = useState<TailObservation>();
-  useEffect(() => {
+function AttemptOutput({ namespace, slug, job, attempts }: RouteIdentity & { attempts: Job[] }) {
+  const latest = attempts.at(-1);
+  const open = Boolean(latest && !latest.completed_at);
+  const beganUnclosed = useRef(open).current;
+  const stored = useStoredOutput(namespace, slug, job, open);
+  const observationKey = `coalesce:tail:${JSON.stringify([namespace, slug, job, latest?.started_at])}`;
+  const [observation, setObservation] = useState<TailObservation | undefined>(() => {
     try {
       const saved = window.sessionStorage.getItem(observationKey);
-      setObservation(saved ? JSON.parse(saved) as TailObservation : undefined);
-    } catch { setObservation(undefined); }
-  }, [observationKey]);
+      const value = saved ? JSON.parse(saved) as TailObservation : undefined;
+      return value && typeof value.text === "string" && Number.isFinite(value.observedAt) ? value : undefined;
+    } catch { return undefined; }
+  });
+  const [beganObservation, setBeganObservation] = useState(open && !observation);
   const finished = useCallback((value: TailObservation) => {
     setObservation(value);
     try { window.sessionStorage.setItem(observationKey, JSON.stringify(value)); } catch { /* The in-memory observation remains available. */ }
@@ -697,26 +712,28 @@ function LogRoute() {
   const observeAgain = useCallback(() => {
     try { window.sessionStorage.removeItem(observationKey); } catch { /* In-memory clearing still works. */ }
     setObservation(undefined);
+    setBeganObservation(true);
   }, [observationKey]);
+  const storedOutput = <section key="stored" className="job-output" aria-label="Stored output">
+    <StoredLog log={stored} job={job} attempts={attempts} primary={!open} beganUnclosed={beganUnclosed} />
+  </section>;
+  const observedOutput = observation || beganObservation ? <section key="observed" className="job-output" aria-label="Observed Pod output">
+    {observation ? <EndedObservation value={observation} primary={open} again={open ? observeAgain : undefined} /> : <StreamingLog namespace={namespace} slug={slug} job={job} finished={finished} canReconnect={open} />}
+  </section> : null;
+  return <>{open ? [observedOutput, storedOutput] : [storedOutput, observedOutput]}</>;
+}
+
+function JobOutputRoute({ namespace, slug, job }: RouteIdentity) {
+  const run = useRemote(`log-run:${namespace}:${slug}`, () => fetchRun(namespace, slug), 5_000, true);
   const attempts = (run.data?.jobs ?? []).filter((candidate) => candidate.job === job);
   const latest = attempts.at(-1);
-  const storedAvailable = stored.data !== undefined;
-  const canTail = Boolean(latest && !latest.completed_at);
-  const observedAvailable = Boolean(observation || canTail);
-  const storedFirst = storedAvailable || !observedAvailable;
   const now = run.updatedAt ?? Date.now();
   useEffect(() => { document.title = `Coalesce — ${job} output`; window.scrollTo(0, 0); }, [namespace, slug, job]);
-  const storedOutput = <section key="stored" className="job-output" aria-label="Stored output">
-    <StoredLog log={stored} job={job} attempts={attempts} primary={storedFirst} />
-  </section>;
-  const observedOutput = observedAvailable ? <section key="observed" className="job-output" aria-label="Observed Pod output">
-    {observation ? <EndedObservation value={observation} primary={!storedFirst} again={canTail ? observeAgain : undefined} /> : <StreamingLog namespace={namespace} slug={slug} job={job} finished={finished} />}
-  </section> : null;
   return <Shell namespace={namespace}>
     <article className="log-record">
       <nav className="breadcrumb" aria-label="Breadcrumb"><Link to={runPath(namespace, slug)}>← Run {slug}</Link></nav>
       <header className="log-title"><p className="eyebrow">Job output</p><h1>{job}</h1></header>
-      {storedFirst ? [storedOutput, observedOutput] : [observedOutput, storedOutput]}
+      {run.loading && !run.data ? <Loading>Reading the Job record…</Loading> : <AttemptOutput key={latest?.started_at ?? "unrecorded"} namespace={namespace} slug={slug} job={job} attempts={attempts} />}
       <section className="output-details" aria-labelledby="job-record-title">
         <h2 id="job-record-title">{attempts.length > 1 ? "Latest Job attempt" : "Job record"}</h2>
         {run.loading ? <Loading>Reading the Job record…</Loading> : null}
@@ -738,6 +755,11 @@ function LogRoute() {
       </section>
     </article>
   </Shell>;
+}
+
+function LogRoute() {
+  const { namespace = "coalesce", slug = "", job = "" } = useParams();
+  return <JobOutputRoute key={JSON.stringify([namespace, slug, job])} namespace={namespace} slug={slug} job={job} />;
 }
 
 function MissingRoute() {
