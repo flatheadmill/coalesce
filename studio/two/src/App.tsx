@@ -515,7 +515,8 @@ function RunJobAccount({ run, namespace }: { run: RunDetail; namespace: string }
   const failed = jobs.filter((job) => job.status === "failed");
   const unclosed = jobs.filter((job) => !job.completed_at);
   if (failed.length) {
-    const latest = failed.at(-1)!;
+    // A retried identity retains its first Map position, not its latest time.
+    const latest = failed.sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at)).at(-1)!;
     return <aside className="job-account job-account-failed"><Claim kind="failed">Job snapshot</Claim><div><h2><JobOutputLink namespace={namespace} slug={run.slug} job={latest.job} /> failed.</h2><p>{failed.length} {failed.length === 1 ? "Job has" : "Jobs have"} a failed latest attempt. Output uses the latest stored address for the Job.</p></div></aside>;
   }
   if (unclosed.length) return <aside className="job-account"><Claim kind="unavailable">Job snapshot</Claim><div><h2>{unclosed.length} {unclosed.length === 1 ? "Job record has" : "Job records have"} no closure.</h2><p>{unclosed.map((job, index) => <span key={`${job.job}:${job.started_at}`}>{index ? ", " : ""}<JobOutputLink namespace={namespace} slug={run.slug} job={job.job} /></span>)}</p></div></aside>;
