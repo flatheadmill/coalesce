@@ -53,7 +53,7 @@ const logPath = (namespace: string, slug: string, job: string) =>
 function JobOutputLink({ namespace, slug, job, children, className = "", describedBy }: {
   namespace: string; slug: string; job: string; children?: ReactNode; className?: string; describedBy?: string;
 }) {
-  return <Link className={`job-output-link ${className}`} to={logPath(namespace, slug, job)} aria-label={`Output for Job ${job}`} aria-describedby={describedBy}>{children ?? job}</Link>;
+  return <Link className={`job-output-link ${className}`} to={logPath(namespace, slug, job)} title="Open output" aria-describedby={describedBy}>{children ?? job}</Link>;
 }
 
 function fullTime(value?: string): string {
@@ -166,7 +166,7 @@ function StatusAccount({ run, compact = false }: { run: Run; compact?: boolean }
   return (
     <div className={`status-account status-${cssStatus(run.status)}`}>
       <Claim kind={kind}>{closed ? run.status : "Unclosed"}</Claim>
-      {closed && compact ? null : <span>{closed ? "Executor outcome · record closed" : compact ? `Stored status: ${run.status}` : `No completion timestamp · stored status: ${run.status}`}</span>}
+      {closed && compact ? null : <span>{closed ? "Executor outcome · record closed" : compact ? `Recorded status: ${run.status}` : `No completion timestamp · recorded status: ${run.status}`}</span>}
     </div>
   );
 }
@@ -177,7 +177,7 @@ function UnclosedJobs({ namespace, run }: { namespace: string; run: Run }) {
   if (detail.error) return <span className="row-note">Job records unavailable</span>;
   const jobs = detail.data?.jobs ?? [];
   const open = jobs.filter((job) => !job.completed_at).length;
-  if (!jobs.length) return <span className="row-corroboration"><Claim kind="unavailable">Job snapshot</Claim><span>No Job record has arrived</span></span>;
+  if (!jobs.length) return <span className="row-corroboration"><Claim kind="unavailable">Job snapshot</Claim><span>No Jobs recorded in this run</span></span>;
   if (!open) return <span className="row-corroboration"><Claim kind="recorded">Job snapshot</Claim><span>{jobs.length === 1 ? "The recorded Job is closed; run closure is absent" : `All ${jobs.length} recorded Jobs are closed; run closure is absent`}</span></span>;
   return <span className="row-corroboration"><Claim kind="unavailable">Job snapshot</Claim><span>{open} {open === 1 ? "Job record" : "Job records"} of {jobs.length} {open === 1 ? "has" : "have"} no closure</span></span>;
 }
@@ -283,7 +283,7 @@ function DeclarationJobStatus({ attempts, id }: { attempts: Job[]; id: string })
   // the latest record, not to a live Pod or a particular stored output.
   const latest = attempts.at(-1);
   const closed = Boolean(latest?.completed_at);
-  const label = !latest ? "No Job record" : !closed ? `Unclosed · recorded ${latest.status}` : latest.status === "completed" ? "Completed" : latest.status === "failed" ? "Failed" : `Recorded ${latest.status}`;
+  const label = !latest ? "Not recorded in this run" : !closed ? `Unclosed · recorded ${latest.status}` : latest.status === "completed" ? "Completed" : latest.status === "failed" ? "Failed" : `Recorded ${latest.status}`;
   const kind = latest?.status === "failed" ? "failed" : closed ? "recorded" : "unavailable";
   return <span id={id} className={`dag-job-status job-state-${kind}`}>
     <span>{label}</span>{attempts.length > 1 ? <span className="job-attempt-count">Latest of {attempts.length} attempts</span> : null}
@@ -495,7 +495,7 @@ function SequenceItem({ event, namespace, slug, now, runStatus, jobs }: {
     <i className="sequence-marker" aria-hidden="true" /><time dateTime={event.at}>{fullTime(event.at)}</time>
     <div className="event-body job-event">
       <Claim kind={failed ? "failed" : closed ? "recorded" : "unavailable"}>{closed ? "Job attempt" : "Unclosed Job"}</Claim>
-      <div className="event-title-line"><div><h3><JobOutputLink namespace={namespace} slug={slug} job={job.job} /></h3><p>{event.total > 1 ? `Attempt ${event.ordinal} of ${event.total} for this Job identity` : "One recorded attempt for this Job identity"}</p></div><span className={`job-status status-${cssStatus(job.status)}`}>Stored · {job.status}</span></div>
+      <div className="event-title-line"><div><h3><JobOutputLink namespace={namespace} slug={slug} job={job.job} />{event.total > 1 ? <span className="visually-hidden"> · Attempt {event.ordinal} of {event.total}</span> : null}</h3><p>{event.total > 1 ? `Attempt ${event.ordinal} of ${event.total} for this Job identity` : "One recorded attempt for this Job identity"}</p></div><span className={`job-status status-${cssStatus(job.status)}`}>Recorded · {job.status}</span></div>
       <dl className="event-facts">
         <Fact label="Opened"><time dateTime={job.started_at}>{fullTime(job.started_at)}</time></Fact>
         <Fact label="Closure" missing={!job.completed_at}>{job.completed_at ? <time dateTime={job.completed_at}>{fullTime(job.completed_at)}</time> : "Not recorded"}</Fact>
@@ -508,16 +508,18 @@ function SequenceItem({ event, namespace, slug, now, runStatus, jobs }: {
 }
 
 function RunJobAccount({ run, namespace }: { run: RunDetail; namespace: string }) {
-  const jobs = run.jobs ?? [];
-  if (!jobs.length) return <aside className="job-account"><Claim kind="unavailable">Job snapshot</Claim><div><h2>No Job record has arrived.</h2><p>The run response supplies no attempt facts to compare with its status.</p></div></aside>;
+  // The run response orders attempts by started_at. Summarize the latest
+  // per identity while leaving every historical attempt in the timeline.
+  const jobs = [...new Map((run.jobs ?? []).map((job) => [job.job, job])).values()];
+  if (!jobs.length) return <aside className="job-account"><Claim kind="unavailable">Job snapshot</Claim><div><h2>No Jobs are recorded in this run.</h2><p>The run response supplies no attempt facts to compare with its status.</p></div></aside>;
   const failed = jobs.filter((job) => job.status === "failed");
   const unclosed = jobs.filter((job) => !job.completed_at);
   if (failed.length) {
     const latest = failed.at(-1)!;
-    return <aside className="job-account job-account-failed"><Claim kind="failed">Job snapshot</Claim><div><h2><JobOutputLink namespace={namespace} slug={run.slug} job={latest.job} /> failed.</h2><p>{failed.length} failed {failed.length === 1 ? "attempt appears" : "attempts appear"} in this snapshot. Output uses the latest stored address for the Job.</p></div></aside>;
+    return <aside className="job-account job-account-failed"><Claim kind="failed">Job snapshot</Claim><div><h2><JobOutputLink namespace={namespace} slug={run.slug} job={latest.job} /> failed.</h2><p>{failed.length} {failed.length === 1 ? "Job has" : "Jobs have"} a failed latest attempt. Output uses the latest stored address for the Job.</p></div></aside>;
   }
   if (unclosed.length) return <aside className="job-account"><Claim kind="unavailable">Job snapshot</Claim><div><h2>{unclosed.length} {unclosed.length === 1 ? "Job record has" : "Job records have"} no closure.</h2><p>{unclosed.map((job, index) => <span key={`${job.job}:${job.started_at}`}>{index ? ", " : ""}<JobOutputLink namespace={namespace} slug={run.slug} job={job.job} /></span>)}</p></div></aside>;
-  return <aside className="job-account"><Claim kind="recorded">Job snapshot</Claim><div><h2>Every recorded Job is closed.</h2><p>{run.completed_at ? `${jobs.length} closed ${jobs.length === 1 ? "Job appears" : "Jobs appear"} in this snapshot.` : "Run closure remains absent; this corroboration does not supply it."}</p></div></aside>;
+  return <aside className="job-account"><Claim kind="recorded">Job snapshot</Claim><div><h2>Every latest Job attempt is closed.</h2><p>{run.completed_at ? `${jobs.length} closed ${jobs.length === 1 ? "Job appears" : "Jobs appear"} in this snapshot.` : "Run closure remains absent; this corroboration does not supply it."}</p></div></aside>;
 }
 
 function RunRoute() {
@@ -546,7 +548,7 @@ function RunRoute() {
       <section className={unclosed ? "claim-account account-unclosed" : "claim-account"}>
         <Claim kind={record.data.run.status === "failed" ? "failed" : unclosed ? "unavailable" : "recorded"}>{unclosed ? "Closure unavailable" : "Recorded run outcome"}</Claim>
         <h2>{unclosed ? "No closing write has reached this record." : `The executor closed this run as ${record.data.run.status}.`}</h2>
-        <p>{unclosed ? `The stored status is “${record.data.run.status}.” That value and the age below do not establish current cluster activity.` : `Coalesce received completion at ${fullTime(record.data.run.completed_at)}.`}</p>
+        <p>{unclosed ? `The recorded status is “${record.data.run.status}.” That value and the age below do not establish current cluster activity.` : `Coalesce received completion at ${fullTime(record.data.run.completed_at)}.`}</p>
       </section>
       <RunJobAccount run={record.data.run} namespace={namespace} />
       <dl className="record-facts">
@@ -675,7 +677,7 @@ function StreamingLog({ namespace, slug, job, finished, canReconnect }: RouteIde
   }, [namespace, slug, job, finished, revision]);
   const output = lines.length ? `${lines.join("\n")}\n` : "";
   const account = <div className={`tail-account tail-${state}`} aria-live="polite">
-    <p>Observed in this tab. Container <code>{containerOf(job)}</code> is taken from the Job name; the server selects a Pod without returning its name or identifying an attempt.</p>
+    <p>Observed in this tab. Container <code>{containerOf(job)}</code> is taken from the Job name; the server selects a Pod without returning its name or matching it to a recorded attempt.</p>
     {canReconnect && (state === "error" || state === "closed") ? <button className="text-action" type="button" onClick={() => setRevision((value) => value + 1)}>Reconnect</button> : null}
   </div>;
   return output ? <LogSurface text={output} label="Observed Pod output" caption={note} annotation={account} /> : <section className="output-wait">
@@ -732,7 +734,9 @@ function JobOutputRoute({ namespace, slug, job }: RouteIdentity) {
   return <Shell namespace={namespace}>
     <article className="log-record">
       <nav className="breadcrumb" aria-label="Breadcrumb"><Link to={runPath(namespace, slug)}>← Run {slug}</Link></nav>
-      <header className="log-title"><p className="eyebrow">Job output</p><h1>{job}</h1></header>
+      <header className="log-title"><p className="eyebrow">Job output</p><h1>{job}</h1>
+        <p className="output-context"><span title={run.data?.pipeline}>{run.data?.pipeline ?? (run.loading ? "Reading pipeline…" : "Pipeline unavailable")}</span><span title={`Namespace ${namespace}`}>Namespace <code>{namespace}</code></span></p>
+      </header>
       {run.loading && !run.data ? <Loading>Reading the Job record…</Loading> : <AttemptOutput key={latest?.started_at ?? "unrecorded"} namespace={namespace} slug={slug} job={job} attempts={attempts} />}
       <section className="output-details" aria-labelledby="job-record-title">
         <h2 id="job-record-title">{attempts.length > 1 ? "Latest Job attempt" : "Job record"}</h2>
@@ -741,7 +745,7 @@ function JobOutputRoute({ namespace, slug, job }: RouteIdentity) {
         {run.data && !latest ? <Empty label="Job record unavailable" title="No matching Job attempt was returned.">The run response has no entry for <code>{job}</code>. Stored output is looked up separately.</Empty> : null}
         {latest ? <>
           {attempts.length > 1 ? <p>{attempts.length} attempts share this Job identity. These facts describe the latest; the output lookup cannot select an attempt.</p> : null}
-          {!latest.completed_at ? <p className="unclosed-note">Job completion is not recorded. Stored status “{latest.status}” does not establish whether a process is running.</p> : null}
+          {!latest.completed_at ? <p className="unclosed-note">Job completion is not recorded. Recorded status “{latest.status}” does not establish whether a process is running.</p> : null}
           <dl className="log-facts">
             <Fact label="Started"><time dateTime={latest.started_at}>{fullTime(latest.started_at)}</time></Fact>
             <Fact label="Completed" missing={!latest.completed_at}>{latest.completed_at ? <time dateTime={latest.completed_at}>{fullTime(latest.completed_at)}</time> : "Not recorded"}</Fact>

@@ -37,6 +37,7 @@ a:focus-visible, button:focus-visible, input:focus-visible, .log-output:focus-vi
   outline: 3px solid var(--observed); outline-offset: 3px;
 }
 code, time, .numeric, .age-value { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 
 .skip-link {
   position: fixed; z-index: 20; top: 0.75rem; left: 0.75rem; padding: 0.7rem 0.9rem;
@@ -263,6 +264,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .log-title { margin-bottom: 1.5rem; }
 .log-title .eyebrow { margin-bottom: 0.6rem; }
 .log-title h1 { overflow-wrap: anywhere; font-family: var(--mono); font-size: clamp(1.4rem, 3vw, 2.4rem); font-weight: 700; line-height: 1.2; letter-spacing: -0.04em; }
+.output-context { display: flex; gap: 1rem; margin: 0.7rem 0 0; color: var(--muted); font-size: 0.75rem; }
+.output-context > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.output-context > span:last-child { flex-shrink: 0; max-width: 50%; }
 .job-output + .job-output { margin-top: 2.5rem; }
 .job-output .notice h2 { font-size: 1.5rem; }
 .output-wait { padding: 1.2rem 1.4rem; border: 1px solid var(--line-strong); background: var(--paper); }
