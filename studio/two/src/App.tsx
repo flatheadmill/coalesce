@@ -44,6 +44,12 @@ const runPath = (namespace: string, slug: string) => `${runsPath(namespace)}/${p
 const logPath = (namespace: string, slug: string, job: string) =>
   `${runPath(namespace, slug)}/logs/${part(job)}`;
 
+function JobOutputLink({ namespace, slug, job, children, className = "" }: {
+  namespace: string; slug: string; job: string; children?: ReactNode; className?: string;
+}) {
+  return <Link className={`job-output-link ${className}`} to={logPath(namespace, slug, job)} aria-label={`Output for Job ${job}`}>{children ?? job}</Link>;
+}
+
 function fullTime(value?: string): string {
   if (!value) return "Not recorded";
   return new Intl.DateTimeFormat(undefined, {
@@ -266,16 +272,21 @@ function dagCount(nodes: DagNode[]): number {
   return nodes.reduce((sum, node) => sum + 1 + dagCount(node.children ?? []), 0);
 }
 
-function DagList({ nodes, prefix = "" }: { nodes: DagNode[]; prefix?: string }) {
+function DagList({ nodes, namespace, slug, jobs, prefix = "" }: {
+  nodes: DagNode[]; namespace: string; slug: string; jobs: Job[]; prefix?: string;
+}) {
   return <ol className={prefix ? "dag-list dag-nested" : "dag-list"}>
     {nodes.map((node, index) => {
       const order = prefix ? `${prefix}.${String(index + 1).padStart(2, "0")}` : String(index + 1).padStart(2, "0");
       const identity = `${node.under}.${node.name}`;
+      const addressable = node.kind === "node" && jobs.some((job) => job.job === identity);
+      const label = <><strong>{node.name}</strong><code>{identity}</code></>;
       return <li key={`${identity}:${order}`}>
-        <div className="dag-node"><span className="dag-order">{order}</span><div><strong>{node.name}</strong><code>{identity}</code></div>
-          <span className="dag-kind">{node.kind === "tranche" ? node.parallel ? "Parallel tranche" : "Ordered tranche" : "Node"}</span>
+        <div className="dag-node"><span className="dag-order">{order}</span>
+          {addressable ? <JobOutputLink namespace={namespace} slug={slug} job={identity} className="dag-identity">{label}</JobOutputLink> : <div className="dag-identity">{label}</div>}
+          <span className="dag-kind">{node.kind === "tranche" ? node.parallel ? "Parallel tranche" : "Ordered tranche" : "Job"}</span>
         </div>
-        {node.children?.length ? <DagList nodes={node.children} prefix={order} /> : null}
+        {node.children?.length ? <DagList nodes={node.children} namespace={namespace} slug={slug} jobs={jobs} prefix={order} /> : null}
       </li>;
     })}
   </ol>;
@@ -410,7 +421,7 @@ function DagGraph({ nodes, createdAt }: { nodes: DagNode[]; createdAt: string })
 type SequenceEvent =
   | { kind: "opened"; at: string }
   | { kind: "declaration"; at: string; dag: DagResponse }
-  | { kind: "job"; at: string; job: Job; ordinal: number; total: number; latest: boolean }
+  | { kind: "job"; at: string; job: Job; ordinal: number; total: number }
   | { kind: "closed"; at: string };
 
 function sequenceFor(record: RunRecord): SequenceEvent[] {
@@ -420,12 +431,11 @@ function sequenceFor(record: RunRecord): SequenceEvent[] {
   const events: SequenceEvent[] = [{ kind: "opened", at: record.run.started_at }];
   if (record.dag) events.push({ kind: "declaration", at: record.dag.created_at, dag: record.dag });
   const jobs = record.run.jobs ?? [];
-  jobs.forEach((job, index) => {
+  jobs.forEach((job) => {
     const ordinal = (seen.get(job.job) ?? 0) + 1;
     seen.set(job.job, ordinal);
     events.push({
       kind: "job", at: job.started_at, job, ordinal, total: counts.get(job.job) ?? 1,
-      latest: !jobs.slice(index + 1).some((candidate) => candidate.job === job.job),
     });
   });
   if (record.run.completed_at) events.push({ kind: "closed", at: record.run.completed_at });
@@ -437,8 +447,8 @@ function Fact({ label, children, missing = false }: { label: string; children: R
   return <div className={missing ? "fact fact-missing" : "fact"}><dt>{label}</dt><dd>{children}</dd></div>;
 }
 
-function SequenceItem({ event, namespace, slug, now, runStatus }: {
-  event: SequenceEvent; namespace: string; slug: string; now: number; runStatus: string;
+function SequenceItem({ event, namespace, slug, now, runStatus, jobs }: {
+  event: SequenceEvent; namespace: string; slug: string; now: number; runStatus: string; jobs: Job[];
 }) {
   if (event.kind === "opened") return <li className="sequence-item event-recorded">
     <i className="sequence-marker" aria-hidden="true" /><time dateTime={event.at}>{fullTime(event.at)}</time>
@@ -448,7 +458,7 @@ function SequenceItem({ event, namespace, slug, now, runStatus }: {
     <i className="sequence-marker" aria-hidden="true" /><time dateTime={event.at}>{fullTime(event.at)}</time>
     <div className="event-body"><Claim kind="recorded">Latest declaration</Claim><h3>{dagCount(event.dag.dag)} declared {dagCount(event.dag.dag) === 1 ? "object" : "objects"}</h3>
       <p>The endpoint returns the newest stored DAG version. It records names, parents, kinds, and nesting—not literal edges.</p>
-      <section className="declaration-record" aria-labelledby="declaration-record-title"><div className="declaration-heading"><Claim kind="recorded">Recorded declaration</Claim><h4 id="declaration-record-title">Nested objects as returned</h4></div><DagList nodes={event.dag.dag} /></section>
+      <section className="declaration-record" aria-labelledby="declaration-record-title"><div className="declaration-heading"><Claim kind="recorded">Recorded declaration</Claim><h4 id="declaration-record-title">Nested objects as returned</h4></div><DagList nodes={event.dag.dag} namespace={namespace} slug={slug} jobs={jobs} /></section>
       <DagGraph nodes={event.dag.dag} createdAt={event.dag.created_at} />
     </div>
   </li>;
@@ -464,17 +474,14 @@ function SequenceItem({ event, namespace, slug, now, runStatus }: {
     <i className="sequence-marker" aria-hidden="true" /><time dateTime={event.at}>{fullTime(event.at)}</time>
     <div className="event-body job-event">
       <Claim kind={failed ? "failed" : closed ? "recorded" : "unavailable"}>{closed ? "Job attempt" : "Unclosed Job"}</Claim>
-      <div className="event-title-line"><div><h3>{job.job}</h3><p>{event.total > 1 ? `Attempt ${event.ordinal} of ${event.total} for this Job identity` : "One recorded attempt for this Job identity"}</p></div><span className={`job-status status-${cssStatus(job.status)}`}>Stored · {job.status}</span></div>
+      <div className="event-title-line"><div><h3><JobOutputLink namespace={namespace} slug={slug} job={job.job} /></h3><p>{event.total > 1 ? `Attempt ${event.ordinal} of ${event.total} for this Job identity` : "One recorded attempt for this Job identity"}</p></div><span className={`job-status status-${cssStatus(job.status)}`}>Stored · {job.status}</span></div>
       <dl className="event-facts">
         <Fact label="Opened"><time dateTime={job.started_at}>{fullTime(job.started_at)}</time></Fact>
         <Fact label="Closure" missing={!job.completed_at}>{job.completed_at ? <time dateTime={job.completed_at}>{fullTime(job.completed_at)}</time> : "Not recorded"}</Fact>
         <Fact label={closed ? "Recorded span" : "Elapsed at latest HTTP read"}><span className="numeric">{closed ? "" : "+"}{span(job.started_at, job.completed_at ?? now)}</span></Fact>
         <Fact label="Exit code" missing={job.exit_code == null}>{job.exit_code ?? "Not recorded"}</Fact>
       </dl>
-      <div className="evidence-address">{event.latest ? <>
-        <Link to={logPath(namespace, slug, job.job)}>{closed ? "Read latest stored log" : "Open cluster observation"}<span aria-hidden="true"> ↗</span></Link>
-        <p>Addressed by run, Job, and derived container identity—not by this attempt timestamp.</p>
-      </> : <><span>No attempt-specific log address</span><p>The contract cannot retrieve this historical attempt directly.</p></>}</div>
+      {event.total > 1 ? <p className="output-address-note">Output is shared by this Job identity. The latest stored output cannot be selected by attempt.</p> : null}
     </div>
   </li>;
 }
@@ -486,9 +493,9 @@ function RunJobAccount({ run, namespace }: { run: RunDetail; namespace: string }
   const unclosed = jobs.filter((job) => !job.completed_at);
   if (failed.length) {
     const latest = failed.at(-1)!;
-    return <aside className="job-account job-account-failed"><Claim kind="failed">Job snapshot</Claim><div><h2>{latest.job} failed.</h2><p>{failed.length} failed {failed.length === 1 ? "attempt appears" : "attempts appear"} in this snapshot. <Link to={logPath(namespace, run.slug, latest.job)}>Read the latest addressable log.</Link></p></div></aside>;
+    return <aside className="job-account job-account-failed"><Claim kind="failed">Job snapshot</Claim><div><h2><JobOutputLink namespace={namespace} slug={run.slug} job={latest.job} /> failed.</h2><p>{failed.length} failed {failed.length === 1 ? "attempt appears" : "attempts appear"} in this snapshot. Output uses the latest stored address for the Job.</p></div></aside>;
   }
-  if (unclosed.length) return <aside className="job-account"><Claim kind="unavailable">Job snapshot</Claim><div><h2>{unclosed.length} {unclosed.length === 1 ? "Job record has" : "Job records have"} no closure.</h2><p>{unclosed.map((job) => job.job).join(", ")}</p></div></aside>;
+  if (unclosed.length) return <aside className="job-account"><Claim kind="unavailable">Job snapshot</Claim><div><h2>{unclosed.length} {unclosed.length === 1 ? "Job record has" : "Job records have"} no closure.</h2><p>{unclosed.map((job, index) => <span key={`${job.job}:${job.started_at}`}>{index ? ", " : ""}<JobOutputLink namespace={namespace} slug={run.slug} job={job.job} /></span>)}</p></div></aside>;
   return <aside className="job-account"><Claim kind="recorded">Job snapshot</Claim><div><h2>Every recorded Job is closed.</h2><p>{run.completed_at ? `${jobs.length} closed ${jobs.length === 1 ? "Job appears" : "Jobs appear"} in this snapshot.` : "Run closure remains absent; this corroboration does not supply it."}</p></div></aside>;
 }
 
@@ -529,7 +536,7 @@ function RunRoute() {
       </dl>
       <section className="sequence" aria-labelledby="sequence-title">
         <div className="section-heading sequence-heading"><div><p className="eyebrow">Accumulated record</p><h2 id="sequence-title">Assertions in time</h2></div><p>{events.length} {events.length === 1 ? "entry" : "entries"} · attempts remain separate</p></div>
-        <ol className="sequence-list">{events.map((event, index) => <SequenceItem key={`${event.kind}:${event.at}:${index}`} event={event} namespace={namespace} slug={slug} now={now} runStatus={record.data!.run.status} />)}
+        <ol className="sequence-list">{events.map((event, index) => <SequenceItem key={`${event.kind}:${event.at}:${index}`} event={event} namespace={namespace} slug={slug} now={now} runStatus={record.data!.run.status} jobs={record.data!.run.jobs ?? []} />)}
           {unclosed ? <li className="sequence-item sequence-open-end"><i className="sequence-marker" aria-hidden="true" /><span className="open-time">No timestamp</span><div className="event-body"><Claim kind="unavailable">Open boundary</Claim><h3>No run closure is recorded</h3><p>The sequence ends where the available evidence ends.</p></div></li> : null}
         </ol>
       </section>
