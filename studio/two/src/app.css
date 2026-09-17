@@ -239,6 +239,10 @@ tbody tr:last-child td { border-bottom: 0; }
 .dag-node strong { overflow-wrap: anywhere; font-family: var(--mono); }
 .dag-node code { color: var(--muted); font-size: 0.68rem; overflow-wrap: anywhere; }
 .dag-kind { color: var(--muted); font-size: 0.63rem; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
+.dag-job-status { display: grid; max-width: 15rem; padding-block: 0.4rem; color: var(--ink-2); font-size: 0.68rem; font-weight: 700; text-align: right; }
+.dag-job-status.job-state-failed { color: var(--failed); }
+.dag-job-status.job-state-unavailable { color: var(--muted); }
+.job-attempt-count { font-size: 0.63rem; font-weight: 500; }
 .dag-nested { margin: 0 0 0 2rem; border-top: 0; border-left: 1px solid var(--line-strong); }
 .declaration-record { margin-top: 1.8rem; }
 .declaration-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1.5rem; }
@@ -345,6 +349,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .job-account { grid-template-columns: 1fr; gap: 0.5rem; }
   .dag-node { grid-template-columns: 3rem minmax(0, 1fr); padding: 0.7rem 0; }
   .dag-kind { grid-column: 2; }
+  .dag-job-status { grid-column: 2; padding: 0; text-align: left; }
   .log-toolbar { align-items: stretch; flex-direction: column; gap: 0; padding-top: 0.9rem; }
   .log-actions { display: grid; grid-template-columns: 1fr 1fr; margin-inline: -1.2rem; margin-top: 0.8rem; border-top: 1px solid #354549; }
   .log-actions button { min-height: 2.75rem; border-bottom: 1px solid #354549; }

@@ -4,6 +4,10 @@ Exhibit two is an authored argument: Coalesce should render bounded claims, not 
 
 **Result**
 
+Declaration Job identities link directly to the existing output route when the full identity matches a Job in the run response. The complete name area is a link, with adjacent latest-attempt status available to both pointer and keyboard users. Tranches and unmatched declarations remain inert. Attempt headings use the same output address and retain the limitation that stored output cannot be selected by attempt.
+
+Output precedes its supporting Job record. Stored and observed text remain separate surfaces, with source and attempt qualifications attached to each surface and connection state in the sticky toolbar. A stored response remains readable when the Job record or Pod tail is unavailable. Observed exits retained in the tab stay separate from recorded exit status, including after Job completion. Desktop and narrow layouts retain the same typography, tree, graph, document scrolling, and output controls.
+
 The register separates closure from outcome. Its closure controls partition the available response into closed and unclosed records, while failed is labeled as a subset of closed. Elapsed ages are frozen at the latest HTTP read rather than ticking like proof of activity. Pipeline statements lead detail pages, opaque slugs remain labeled as addresses, and Job corroboration names the stored snapshot as its source.
 
 Run detail puts a failed Job and its evidence address above the fold, then preserves the full assertion sequence. Log pages use document scrolling with sticky navigation instead of nesting a vertical terminal inside the page. Search names its one-hundred-record scope and recognizes the same closure vocabulary the interface displays.
@@ -25,6 +29,12 @@ The global claim key remains visible narrowly because its learned grammar is use
 The initial detail read for each unclosed register row is a deliberate, bounded cost: the list contract cannot otherwise reveal the Job/run closure discrepancy. It does not poll. Duplicate initial reads and tail connections under the development server come from React StrictMode’s development remount and do not occur in the production bundle. Run families, sibling navigation, Kubernetes object identities, and causal summaries remain absent because neither the API nor the observed payload supplies those relations. Meaningful pipeline prose leads while the opaque slug remains explicit as the address.
 
 **Measured verification**
+
+The output revision passes all three studio TypeScript checks and production builds, plus `go test ./...`. Chromium checks use the declaration generated from `test/fanout.coalesce.zsh` with representative Job records and HTTP/WebSocket responses. They cover full-identity matching across repeated leaf names, inert tranches and unmatched Jobs, clicks across the name area, Tab and Enter activation, browser Back, and status descriptions for screen readers. Latest-attempt status is checked independently from the historical attempt rows.
+
+Output is visible before Job details at 1440, 390, and 320 pixels. The checks cover exact clipboard contents, wrapping, repeated attempts, empty and unavailable stored output, unavailable run records, simultaneous stored and observed output, tail disconnection with and without received lines, and saved observed exits that remain distinct from recorded exit status after reload and Job completion. The 14-Job, 20-relation graph remains unchanged. These checks use local fixtures; they do not establish behavior against a running cluster.
+
+The remaining measurements and limits below describe the original design cut.
 
 The live window on August 30, 2026 contained 100 newest-first runs over roughly 38 hours, 83 completed outcomes, 12 failed outcomes, 5 unclosed runs, 162 Job rows, and 100 available DAG declarations. Three unclosed runs had every returned Job closed; two had one Job without closure. No repeated Job identity appeared in that window.
 

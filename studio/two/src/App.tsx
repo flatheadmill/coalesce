@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { Link, Navigate, Route, Routes, useParams } from "react-router-dom";
 import type { Core, ElementDefinition, StylesheetJson } from "cytoscape";
 import {
@@ -44,10 +44,10 @@ const runPath = (namespace: string, slug: string) => `${runsPath(namespace)}/${p
 const logPath = (namespace: string, slug: string, job: string) =>
   `${runPath(namespace, slug)}/logs/${part(job)}`;
 
-function JobOutputLink({ namespace, slug, job, children, className = "" }: {
-  namespace: string; slug: string; job: string; children?: ReactNode; className?: string;
+function JobOutputLink({ namespace, slug, job, children, className = "", describedBy }: {
+  namespace: string; slug: string; job: string; children?: ReactNode; className?: string; describedBy?: string;
 }) {
-  return <Link className={`job-output-link ${className}`} to={logPath(namespace, slug, job)} aria-label={`Output for Job ${job}`}>{children ?? job}</Link>;
+  return <Link className={`job-output-link ${className}`} to={logPath(namespace, slug, job)} aria-label={`Output for Job ${job}`} aria-describedby={describedBy}>{children ?? job}</Link>;
 }
 
 function fullTime(value?: string): string {
@@ -272,19 +272,34 @@ function dagCount(nodes: DagNode[]): number {
   return nodes.reduce((sum, node) => sum + 1 + dagCount(node.children ?? []), 0);
 }
 
+function DeclarationJobStatus({ attempts, id }: { attempts: Job[]; id: string }) {
+  // The run endpoint orders attempts by started_at; status here belongs to
+  // the latest record, not to a live Pod or a particular stored output.
+  const latest = attempts.at(-1);
+  const closed = Boolean(latest?.completed_at);
+  const label = !latest ? "No Job record" : !closed ? `Unclosed · recorded ${latest.status}` : latest.status === "completed" ? "Completed" : latest.status === "failed" ? "Failed" : `Recorded ${latest.status}`;
+  const kind = latest?.status === "failed" ? "failed" : closed ? "recorded" : "unavailable";
+  return <span id={id} className={`dag-job-status job-state-${kind}`}>
+    <span>{label}</span>{attempts.length > 1 ? <span className="job-attempt-count">Latest of {attempts.length} attempts</span> : null}
+  </span>;
+}
+
 function DagList({ nodes, namespace, slug, jobs, prefix = "" }: {
   nodes: DagNode[]; namespace: string; slug: string; jobs: Job[]; prefix?: string;
 }) {
+  const listId = useId();
   return <ol className={prefix ? "dag-list dag-nested" : "dag-list"}>
     {nodes.map((node, index) => {
       const order = prefix ? `${prefix}.${String(index + 1).padStart(2, "0")}` : String(index + 1).padStart(2, "0");
       const identity = `${node.under}.${node.name}`;
-      const addressable = node.kind === "node" && jobs.some((job) => job.job === identity);
+      const attempts = node.kind === "node" ? jobs.filter((job) => job.job === identity) : [];
+      const addressable = attempts.length > 0;
+      const statusId = `${listId}-${order}`;
       const label = <><strong>{node.name}</strong><code>{identity}</code></>;
       return <li key={`${identity}:${order}`}>
         <div className="dag-node"><span className="dag-order">{order}</span>
-          {addressable ? <JobOutputLink namespace={namespace} slug={slug} job={identity} className="dag-identity">{label}</JobOutputLink> : <div className="dag-identity">{label}</div>}
-          <span className="dag-kind">{node.kind === "tranche" ? node.parallel ? "Parallel tranche" : "Ordered tranche" : "Job"}</span>
+          {addressable ? <JobOutputLink namespace={namespace} slug={slug} job={identity} className="dag-identity" describedBy={statusId}>{label}</JobOutputLink> : <div className="dag-identity">{label}</div>}
+          {node.kind === "tranche" ? <span className="dag-kind">{node.parallel ? "Parallel tranche" : "Ordered tranche"}</span> : <DeclarationJobStatus attempts={attempts} id={statusId} />}
         </div>
         {node.children?.length ? <DagList nodes={node.children} namespace={namespace} slug={slug} jobs={jobs} prefix={order} /> : null}
       </li>;
