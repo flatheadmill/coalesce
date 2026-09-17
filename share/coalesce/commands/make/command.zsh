@@ -19,11 +19,12 @@ function :args:make {
 #
 # binaryData is printed rather than rendered, because a YAML writer is entitled
 # to fold a long scalar and Kubernetes will not accept a folded base64 payload.
-# The archive uses a sorted file list fed to a
-# non-recursing tar, ustar to avoid extended headers, ownership flattened, and
-# gzip told to omit its header, so an unchanged directory does not churn the
-# ConfigMap. COPYFILE_DISABLE keeps macOS extended attributes from arriving as
-# AppleDouble files.
+# The archive uses a sorted file list fed to a non-recursing tar, ustar to avoid
+# extended headers, ownership and mtimes flattened, and gzip told to omit its
+# timestamp, so a fresh checkout does not churn the ConfigMap. Normalize a copy
+# because older bsdtar versions cannot override mtimes and rendering must not
+# touch the source. COPYFILE_DISABLE keeps macOS extended attributes from
+# arriving as AppleDouble files.
 function :execute:make {
     setopt localoptions pipefail
     typeset file separator= files=( "$@" )
@@ -45,14 +46,22 @@ function :execute:make {
         print -r -- 'binaryData:'
         print -nr -- '  ball.tar.gz: '
         (
-            cd $file
-            find . -type f -print | LC_ALL=C sort |
-                COPYFILE_DISABLE=1 bsdtar -c --format ustar \
-                    --uid 0 --gid 0 --uname root --gname root \
-                    --no-recursion -T - -f - |
-                gzip -n |
-                base64 |
-                tr -d '\n'
+            typeset archive
+            archive=$(mktemp -d) || return 1
+            {
+                cp -Rp $file/. $archive || return 1
+                cd $archive || return 1
+                TZ=UTC find . -type f -exec touch -t 197001010000.00 {} + || return 1
+                find . -type f -print | LC_ALL=C sort |
+                    COPYFILE_DISABLE=1 bsdtar -c --format ustar \
+                        --uid 0 --gid 0 --uname root --gname root \
+                        --no-recursion -T - -f - |
+                    gzip -n |
+                    base64 |
+                    tr -d '\n'
+            } always {
+                rm -rf $archive
+            }
         ) || abend 'unable to archive `%s`' $file
         print
     done

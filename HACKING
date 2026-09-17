@@ -136,6 +136,18 @@ The Docker build runs both stages itself and is the path that ships.
 
 ---
 
+Testing the Manifest Renderer
+
+With zshctl, gojq, bsdtar, and gzip on PATH, run:
+
+    zsh test/make.test.zsh
+
+This checks reproducibility across checkout timestamps, preserved source and
+executable permissions, content changes, and archive failures. It runs locally
+without Kubernetes access.
+
+---
+
 The Substrate Loop
 
 After editing server Go code:
