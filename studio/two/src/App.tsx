@@ -550,7 +550,9 @@ function bytesLabel(value: number): string {
   return value < 1_024 ? `${value} B` : `${(value / 1_024).toFixed(value >= 10_240 ? 0 : 1)} KiB`;
 }
 
-function LogSurface({ text, label, startAtEnd = false }: { text: string; label: string; startAtEnd?: boolean }) {
+function LogSurface({ text, label, caption, annotation, startAtEnd = false }: {
+  text: string; label: string; caption?: ReactNode; annotation?: ReactNode; startAtEnd?: boolean;
+}) {
   const [copyState, setCopyState] = useState("Copy exact text");
   const [wrap, setWrap] = useState(true);
   const frame = useRef<HTMLDivElement>(null);
@@ -575,76 +577,90 @@ function LogSurface({ text, label, startAtEnd = false }: { text: string; label: 
     } catch { setCopyState("Copy unavailable"); }
   };
   return <div className="log-frame" ref={frame}>
-    <div className="log-toolbar"><div><span>{label}</span><small>{lines} lines · {bytesLabel(bytes)}{startAtEnd ? " · opened at end" : ""}</small></div>
+    <div className="log-toolbar"><div><span>{label}</span>{caption ? <small aria-live="polite">{caption}</small> : null}<small>{lines} lines · {bytesLabel(bytes)}{startAtEnd ? " · opened at end" : ""}</small></div>
       <div className="log-actions"><button type="button" onClick={() => frame.current?.scrollIntoView({ block: "start" })}>Beginning</button><button type="button" onClick={() => end.current?.scrollIntoView({ block: "center" })}>End</button><button type="button" aria-pressed={!wrap} onClick={() => setWrap((value) => !value)}>{wrap ? "Preserve columns" : "Wrap lines"}</button><button type="button" onClick={() => void copy()}>{copyState}</button></div>
     </div>
-    <pre className={`log-output ${wrap ? "" : "preserve-columns"}`} tabIndex={0} aria-label={label}>{text || "No log text was returned.\n"}</pre><span ref={end} className="log-end-marker" aria-hidden="true" />
+    <pre className={`log-output ${wrap ? "" : "preserve-columns"}`} tabIndex={0} aria-label={label}>{text}</pre><span ref={end} className="log-end-marker" aria-hidden="true" />
+    {text === "" ? <p className="log-empty" role="status">The response contained no output.</p> : null}
+    {annotation ? <div className="log-annotation">{annotation}</div> : null}
   </div>;
 }
 
-function StoredLog({ log, failed = false }: { log: Remote<string> & { reload: () => void }; failed?: boolean }) {
-  if (log.loading) return <Loading>Reading the latest stored artifact…</Loading>;
+function StoredLog({ log, job, attempts, primary }: {
+  log: Remote<string> & { reload: () => void }; job: string; attempts: Job[]; primary: boolean;
+}) {
+  const latest = attempts.at(-1);
+  if (log.loading) return <Loading>Reading stored output…</Loading>;
   if (log.error instanceof ApiError && log.error.status === 404) return <section className="notice artifact-missing" role="status">
-    <Claim kind="unavailable">Stored artifact unavailable</Claim><h2>Coalesce answered 404 for this log identity.</h2>
-    <p>No artifact is addressable at the latest-only stored endpoint. It may still arrive, or harvest may never have completed.</p>
-    <button className="text-action" type="button" onClick={log.reload}>Check the stored address again</button>
+    <Claim kind="unavailable">Stored output unavailable</Claim><h2>No stored output was found.</h2>
+    <p>The server returned 404 for this Job and container. Output may still be collected later.</p>
+    <button className="text-action" type="button" onClick={log.reload}>Check again</button>
   </section>;
-  if (log.error) return <Problem error={log.error} retry={log.reload} />;
-  return <LogSurface text={log.data ?? ""} label="Latest stored log artifact" startAtEnd={failed} />;
+  if (log.error) return <div className="output-problem"><p className="eyebrow">Stored output unavailable</p><Problem error={log.error} retry={log.reload} /></div>;
+  return <LogSurface text={log.data ?? ""} label="Stored output" caption={attempts.length > 1 ? `${attempts.length} attempts · output attempt unspecified` : "Latest stored response"} startAtEnd={primary && latest?.status === "failed"} annotation={<>
+    <p>Container <code>{containerOf(job)}</code>, from the Job name. Latest stored output; its attempt is unspecified.</p>
+    {attempts.length > 1 ? <p>{attempts.length} attempts share this address. Output cannot be selected or attributed by attempt.</p> : null}
+    {latest && !latest.completed_at ? <p>Job completion is not recorded. Stored output does not establish whether a process is still running.</p> : null}
+  </>} />;
 }
 
 interface TailObservation { exitCode?: string; reason?: string; observedAt: number; text: string }
-type TailState = "connecting" | "observed" | "error" | "exited";
+type TailState = "connecting" | "observed" | "error" | "exited" | "closed";
 
 function StreamingLog({ namespace, slug, job, finished }: RouteIdentity & { finished: (value: TailObservation) => void }) {
   const [lines, setLines] = useState<string[]>([]);
   const linesRef = useRef<string[]>([]);
   const [state, setState] = useState<TailState>("connecting");
-  const [note, setNote] = useState("Opening a WebSocket to a pod selected by the server.");
+  const [note, setNote] = useState("Connecting to Pod output.");
   const [revision, setRevision] = useState(0);
   useEffect(() => {
+    let current = true;
     let exited = false;
+    let failed = false;
     linesRef.current = [];
     setLines([]);
     setState("connecting");
-    setNote("Opening a WebSocket to a pod selected by the server.");
+    setNote("Connecting to Pod output.");
     const tail = openLogTail(namespace, slug, job, containerOf(job));
-    tail.onopen = () => { setState("observed"); setNote("This browser is receiving a current cluster observation."); };
+    tail.onopen = () => { if (current) { setState("observed"); setNote("Connected to Pod output."); } };
     tail.onmessage = (message) => {
+      if (!current) return;
       try {
         const event = parseStreamEvent(String(message.data));
         if (event.kind === "log_line") {
           linesRef.current = [...linesRef.current, String(event.data.line ?? "")];
           setLines(linesRef.current);
         }
-        else if (event.kind === "log_status") { setState("observed"); setNote(`The selected pod reported phase ${String(event.data.phase ?? "unknown")}.`); }
+        else if (event.kind === "log_status") { setState("observed"); setNote(`Pod phase observed: ${String(event.data.phase ?? "not supplied")}.`); }
         else if (event.kind === "log_exit") {
           exited = true;
           const value = { exitCode: String(event.data.exit_code ?? "not supplied"), reason: String(event.data.reason ?? "not supplied"), observedAt: Date.now(), text: linesRef.current.length ? `${linesRef.current.join("\n")}\n` : "" };
           setState("exited");
-          setNote(`This connection observed process exit ${value.exitCode}; termination reason ${value.reason}.`);
+          setNote(`Process exit ${value.exitCode} observed; ${value.reason}.`);
           finished(value);
-        } else if (event.kind === "log_error") { setState("error"); setNote(String(event.data.error ?? "The tail reported an unspecified error.")); }
-      } catch { setState("error"); setNote("A WebSocket event arrived, but this browser could not parse it."); }
+        } else if (event.kind === "log_error") { failed = true; setState("error"); setNote(String(event.data.error ?? "The output stream failed.")); }
+      } catch { failed = true; setState("error"); setNote("The output stream sent an unreadable message."); }
     };
-    tail.onerror = () => { if (!exited) { setState("error"); setNote("No pod accepted the requested live tail connection."); } };
-    return () => tail.close();
+    tail.onerror = () => { if (current && !exited) { failed = true; setState("error"); setNote("The Pod output connection failed."); } };
+    tail.onclose = () => { if (current && !exited && !failed) { setState("closed"); setNote("The connection closed without reporting process exit."); } };
+    return () => { current = false; tail.close(); };
   }, [namespace, slug, job, finished, revision]);
   const output = lines.length ? `${lines.join("\n")}\n` : "";
-  return <>
-    <div className={`tail-account tail-${state}`} aria-live="polite">
-      <Claim kind={state === "observed" || state === "exited" ? "observed" : "unavailable"}>{state === "connecting" ? "Connecting" : state === "observed" ? "Observed now" : state === "exited" ? "Observed exit" : "Observation unavailable"}</Claim>
-      <p>{note}</p><small>This account belongs to this browser session and is not the stored run record.</small>{state === "error" ? <button className="text-action" type="button" onClick={() => setRevision((value) => value + 1)}>Try observation again</button> : null}
-    </div>
-    {output ? <LogSurface text={output} label="Current browser observation" /> : <div className="observation-empty" role="status"><p>{state === "error" ? "No log lines were received from this request." : "No log lines have been received yet."}</p><small>This interface message is not counted or copyable as observed evidence.</small></div>}
-  </>;
+  const account = <div className={`tail-account tail-${state}`} aria-live="polite">
+    <p>Observed in this tab. Container <code>{containerOf(job)}</code> is taken from the Job name; the server selects a Pod without returning its name or identifying an attempt.</p>
+    {state === "error" || state === "closed" ? <button className="text-action" type="button" onClick={() => setRevision((value) => value + 1)}>Reconnect</button> : null}
+  </div>;
+  return output ? <LogSurface text={output} label="Observed Pod output" caption={note} annotation={account} /> : <section className="output-wait">
+    <p className="eyebrow">Pod output</p><p role="status">{state === "error" || state === "closed" ? "No output was received from this connection." : "Waiting for output…"}</p><p aria-live="polite">{note}</p>{account}
+  </section>;
 }
 
-function EndedObservation({ value, again }: { value: TailObservation; again: () => void }) {
-  return <div className="ended-observation"><aside className="observed-exit"><Claim kind="observed">Session observation</Claim><div>
-    <p>This browser observed exit <strong>{value.exitCode ?? "not supplied"}</strong> with reason <strong>{value.reason ?? "not supplied"}</strong> at {readTime(value.observedAt)}.</p>
-    <small>Kept in sessionStorage for this tab: it survives reload and same-tab navigation, is normally cleared when the tab closes, and is not stored by Coalesce.</small></div><button className="text-action" type="button" onClick={again}>Observe again</button>
-  </aside><LogSurface text={value.text} label="Ended browser observation" startAtEnd /></div>;
+function EndedObservation({ value, primary, again }: { value: TailObservation; primary: boolean; again?: () => void }) {
+  return <LogSurface text={value.text} label="Observed Pod output" caption={`Process exit ${value.exitCode ?? "not supplied"} observed · saved in this tab`} startAtEnd={primary} annotation={<div className="ended-observation">
+    <p><Claim kind="observed">Process exit observed</Claim> Exit <strong>{value.exitCode ?? "not supplied"}</strong> · {value.reason ?? "reason not supplied"} · {fullTime(new Date(value.observedAt).toISOString())}.</p>
+    <p>Saved in this tab across reloads, not in the stored Job record. The selected Pod and output attempt are unspecified.</p>
+    {again ? <button className="text-action" type="button" onClick={again}>Reconnect</button> : null}
+  </div>} />;
 }
 
 function LogRoute() {
@@ -661,7 +677,7 @@ function LogRoute() {
   }, [observationKey]);
   const finished = useCallback((value: TailObservation) => {
     setObservation(value);
-    try { window.sessionStorage.setItem(observationKey, JSON.stringify(value)); } catch { /* The in-memory session account remains available. */ }
+    try { window.sessionStorage.setItem(observationKey, JSON.stringify(value)); } catch { /* The in-memory observation remains available. */ }
   }, [observationKey]);
   const observeAgain = useCallback(() => {
     try { window.sessionStorage.removeItem(observationKey); } catch { /* In-memory clearing still works. */ }
@@ -670,40 +686,42 @@ function LogRoute() {
   const attempts = (run.data?.jobs ?? []).filter((candidate) => candidate.job === job);
   const latest = attempts.at(-1);
   const storedAvailable = stored.data !== undefined;
+  const canTail = Boolean(latest && !latest.completed_at);
+  const observedAvailable = Boolean(observation || canTail);
+  const storedFirst = storedAvailable || !observedAvailable;
   const now = run.updatedAt ?? Date.now();
-  useEffect(() => { document.title = `Coalesce — ${job} evidence`; }, [job]);
+  useEffect(() => { document.title = `Coalesce — ${job} output`; window.scrollTo(0, 0); }, [namespace, slug, job]);
+  const storedOutput = <section key="stored" className="job-output" aria-label="Stored output">
+    <StoredLog log={stored} job={job} attempts={attempts} primary={storedFirst} />
+  </section>;
+  const observedOutput = observedAvailable ? <section key="observed" className="job-output" aria-label="Observed Pod output">
+    {observation ? <EndedObservation value={observation} primary={!storedFirst} again={canTail ? observeAgain : undefined} /> : <StreamingLog namespace={namespace} slug={slug} job={job} finished={finished} />}
+  </section> : null;
   return <Shell namespace={namespace}>
-    <nav className="breadcrumb" aria-label="Breadcrumb"><Link to={runPath(namespace, slug)}>← Run {slug}</Link></nav>
-    <header className="log-title"><div><p className="eyebrow">Job identity / latest addressable evidence</p><h1>{job}</h1><p className="pipeline-title">{run.data?.pipeline ?? "Pipeline statement unavailable"}</p><p className="run-identity">Run <code>{slug}</code></p></div>
-      {latest ? <Claim kind={storedAvailable ? "recorded" : observation ? "observed" : "unavailable"}>{storedAvailable ? "Stored artifact" : observation ? "Observed exit" : "Evidence resolving"}</Claim> : null}
-    </header>
-    {run.loading ? <Loading>Reading the latest Job attempt…</Loading> : null}
-    {run.error instanceof ApiError && run.error.status === 404 ? <Empty label="Missing parent" title="The run record is unavailable.">Coalesce has no run named <code>{slug}</code> in namespace <code>{namespace}</code>.</Empty> : run.error ? <Problem error={run.error} retry={run.reload} /> : null}
-    {run.data && !latest ? <Empty label="Missing Job identity" title="This run has no matching attempt.">No Job named <code>{job}</code> appears in the available run snapshot.</Empty> : null}
-    {run.data && latest ? <article className="log-record">
-      <section className={`log-custody ${storedAvailable ? "custody-stored" : observation ? "custody-observed" : "custody-unavailable"}`}><Claim kind={storedAvailable ? "recorded" : observation ? "observed" : "unavailable"}>{storedAvailable && !latest.completed_at ? "Stored artifact · closure absent" : storedAvailable ? "Bucket custody" : observation ? "Browser custody" : "Evidence boundary"}</Claim>
-        <h2>{storedAvailable && !latest.completed_at ? "A stored artifact exists while the Job record remains unclosed." : storedAvailable ? "Newest stored artifact for this identity" : observation ? "This browser observed the tail end; durable closure is absent" : "Stored and observed evidence are resolved independently."}</h2>
-        <p>{storedAvailable ? "The latest-only endpoint returned an artifact matching run, Job, and derived container. That lookup does not prove which attempt deposited it, and it does not supply the absent Job closure." : observation ? "The browser observation is separate from both the stored Job response and the latest-only artifact lookup." : "Job closure does not decide whether an artifact exists. The stored endpoint and any browser observation are accounted for separately below."}</p>
+    <article className="log-record">
+      <nav className="breadcrumb" aria-label="Breadcrumb"><Link to={runPath(namespace, slug)}>← Run {slug}</Link></nav>
+      <header className="log-title"><p className="eyebrow">Job output</p><h1>{job}</h1></header>
+      {storedFirst ? [storedOutput, observedOutput] : [observedOutput, storedOutput]}
+      <section className="output-details" aria-labelledby="job-record-title">
+        <h2 id="job-record-title">{attempts.length > 1 ? "Latest Job attempt" : "Job record"}</h2>
+        {run.loading ? <Loading>Reading the Job record…</Loading> : null}
+        {run.error instanceof ApiError && run.error.status === 404 ? <Empty label="Run unavailable" title="The run record was not found.">No run named <code>{slug}</code> was returned for namespace <code>{namespace}</code>.</Empty> : run.error ? <Problem error={run.error} retry={run.reload} /> : null}
+        {run.data && !latest ? <Empty label="Job record unavailable" title="No matching Job attempt was returned.">The run response has no entry for <code>{job}</code>. Stored output is looked up separately.</Empty> : null}
+        {latest ? <>
+          {attempts.length > 1 ? <p>{attempts.length} attempts share this Job identity. These facts describe the latest; the output lookup cannot select an attempt.</p> : null}
+          {!latest.completed_at ? <p className="unclosed-note">Job completion is not recorded. Stored status “{latest.status}” does not establish whether a process is running.</p> : null}
+          <dl className="log-facts">
+            <Fact label="Started"><time dateTime={latest.started_at}>{fullTime(latest.started_at)}</time></Fact>
+            <Fact label="Completed" missing={!latest.completed_at}>{latest.completed_at ? <time dateTime={latest.completed_at}>{fullTime(latest.completed_at)}</time> : "Not recorded"}</Fact>
+            <Fact label={latest.completed_at ? "Recorded duration" : "Elapsed at latest read"}><span className="numeric">{latest.completed_at ? "" : "+"}{span(latest.started_at, latest.completed_at ?? now)}</span></Fact>
+            <Fact label="Recorded status">{latest.status}</Fact>
+            <Fact label="Recorded exit status" missing={latest.exit_code == null}>{latest.exit_code ?? "Not recorded"}</Fact>
+            <Fact label="Container from Job name"><code>{containerOf(job)}</code></Fact>
+          </dl>
+        </> : null}
+        {run.data ? <p className="pipeline-title">{run.data.pipeline}</p> : null}
       </section>
-      {attempts.length > 1 ? <aside className="attempt-boundary"><Claim kind="unavailable">Selection boundary</Claim><p>{attempts.length} attempts share this Job identity. This route cannot select one by timestamp; the facts below describe the latest attempt.</p></aside> : null}
-      <dl className="log-facts">
-        <Fact label="Latest attempt opened"><time dateTime={latest.started_at}>{fullTime(latest.started_at)}</time></Fact>
-        <Fact label="Latest attempt closure" missing={!latest.completed_at}>{latest.completed_at ? <time dateTime={latest.completed_at}>{fullTime(latest.completed_at)}</time> : "Not recorded"}</Fact>
-        <Fact label={latest.completed_at ? "Recorded span" : "Elapsed at latest HTTP read"}><span className="numeric">{latest.completed_at ? "" : "+"}{span(latest.started_at, latest.completed_at ?? now)}</span></Fact>
-        <Fact label="Stored status">{latest.status}</Fact>
-        <Fact label="Stored exit code" missing={latest.exit_code == null}>{latest.exit_code ?? "Not recorded"}</Fact>
-        <Fact label="Derived container"><code>{containerOf(job)}</code></Fact>
-      </dl>
-      {observation && latest.completed_at ? <aside className="observed-exit compact-observation"><Claim kind="observed">Earlier session observation</Claim><div><p>This tab observed exit <strong>{observation.exitCode ?? "not supplied"}</strong> with reason <strong>{observation.reason ?? "not supplied"}</strong> at {readTime(observation.observedAt)}.</p><small>The durable record is now shown below; this session account is not its source.</small></div></aside> : null}
-      <section className="log-evidence" aria-labelledby="stored-evidence-title">
-        <div className="section-heading"><div><p className="eyebrow">Bucket custody / latest-only lookup</p><h2 id="stored-evidence-title">Stored evidence</h2></div><p>Exact text returned for run, Job, and derived container</p></div>
-        <StoredLog log={stored} failed={latest.status === "failed"} />
-      </section>
-      {!latest.completed_at ? <section className="log-evidence observation-evidence" aria-labelledby="observed-evidence-title">
-        <div className="section-heading"><div><p className="eyebrow">Browser custody / separate request</p><h2 id="observed-evidence-title">Browser observation</h2></div><p>Lines, status, and exit seen only by this browser</p></div>
-        {observation ? <EndedObservation value={observation} again={observeAgain} /> : <StreamingLog namespace={namespace} slug={slug} job={job} finished={finished} />}
-      </section> : null}
-    </article> : null}
+    </article>
   </Shell>;
 }
 

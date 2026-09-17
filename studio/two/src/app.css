@@ -171,21 +171,21 @@ tbody tr:last-child td { border-bottom: 0; }
 
 .breadcrumb { margin-bottom: 4rem; }
 .breadcrumb a { display: inline-flex; align-items: center; min-height: 2.75rem; font-size: 0.72rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
-.record-title, .log-title { display: grid; grid-template-columns: minmax(0, 1fr) 18rem; align-items: start; gap: 4rem; margin-bottom: 3rem; }
-.record-title h1, .log-title h1 { overflow-wrap: anywhere; font-family: var(--mono); font-size: clamp(2.8rem, 6vw, 5.3rem); font-weight: 700; }
+.record-title { display: grid; grid-template-columns: minmax(0, 1fr) 18rem; align-items: start; gap: 4rem; margin-bottom: 3rem; }
+.record-title h1 { overflow-wrap: anywhere; font-family: var(--mono); font-size: clamp(2.8rem, 6vw, 5.3rem); font-weight: 700; }
 .record-title h1.pipeline-heading { max-width: 22ch; font-family: inherit; font-size: clamp(2.3rem, 4.5vw, 4.2rem); font-weight: 800; }
 .record-title > .status-account { margin-top: 1.6rem; padding-top: 1rem; border-top: 4px solid var(--ink); }
 .pipeline-title { max-width: 70ch; margin: 1rem 0 0; color: var(--muted); font-family: var(--mono); font-size: 0.8rem; overflow-wrap: anywhere; }
 .run-identity { max-width: 80ch; margin: 1rem 0 0; color: var(--muted); font-size: 0.72rem; }
 .run-identity code { color: var(--ink-2); overflow-wrap: anywhere; }
 
-.claim-account, .log-custody {
+.claim-account {
   margin-bottom: 2rem; padding: 1.8rem 2rem 2rem; border: 1px solid var(--ink); border-top: 6px solid var(--ink); background: var(--paper);
 }
 .claim-account.account-unclosed { border-top-color: var(--unavailable); background: linear-gradient(90deg, var(--unavailable-wash), var(--paper) 48%); }
-.claim-account .claim, .log-custody .claim { margin-bottom: 1rem; }
-.claim-account h2, .log-custody h2 { margin-bottom: 0.8rem; }
-.claim-account p, .log-custody p { max-width: 76ch; margin-bottom: 0; color: var(--ink-2); }
+.claim-account .claim { margin-bottom: 1rem; }
+.claim-account h2 { margin-bottom: 0.8rem; }
+.claim-account p { max-width: 76ch; margin-bottom: 0; color: var(--ink-2); }
 .job-account { display: grid; grid-template-columns: 13rem minmax(0, 1fr); gap: 1.5rem; align-items: start; margin: -0.5rem 0 2rem; padding: 1.1rem 1.25rem; border-left: 5px solid var(--unavailable); background: var(--unavailable-wash); }
 .job-account.job-account-failed { border-left-color: var(--failed); background: var(--failed-wash); }
 .job-account h2 { margin-bottom: 0.3rem; font-size: 1.15rem; }
@@ -255,27 +255,19 @@ tbody tr:last-child td { border-bottom: 0; }
 .topology-state-failed { color: var(--unavailable); }
 .sequence-open-end { border-bottom-color: var(--unavailable); }
 
-.log-title > .claim { justify-self: end; margin-top: 1.6rem; }
-.log-custody.custody-observed { border-top-color: var(--observed); }
-.log-custody.custody-unavailable { border-top-color: var(--unavailable); }
-.attempt-boundary, .observed-exit {
-  display: grid; grid-template-columns: 14rem 1fr; gap: 1.5rem; align-items: start;
-  margin-bottom: 2rem; padding: 1.2rem 1.4rem; border-left: 5px solid var(--unavailable); background: var(--unavailable-wash);
-}
-.attempt-boundary p, .observed-exit p { margin: 0; }
-.observed-exit { border-left-color: var(--observed); background: var(--observed-wash); }
-.observed-exit small { display: block; margin-top: 0.25rem; color: var(--muted); }
-.observed-exit .text-action { justify-self: end; align-self: center; }
-.log-evidence { margin-top: 5rem; }
-.tail-account { margin-bottom: 1rem; padding: 1.2rem 1.4rem; border-left: 5px solid var(--observed); background: var(--observed-wash); }
-.tail-account.tail-error, .tail-account.tail-connecting { border-left-color: var(--unavailable); background: var(--unavailable-wash); }
-.tail-account p { margin: 0.6rem 0 0.2rem; }
-.tail-account small { color: var(--muted); }
-.tail-account .text-action { display: block; margin-top: 0.7rem; }
-.observation-empty { min-height: 10rem; padding: 2rem 1.4rem; border: 1px solid var(--line-strong); background: var(--paper); }
-.observation-empty p { margin-bottom: 0.35rem; font-weight: 750; }
-.observation-empty small { color: var(--muted); }
-.observation-evidence { padding-top: 2rem; border-top: 1px solid var(--line-strong); }
+.log-record .breadcrumb { margin-bottom: 1rem; }
+.log-title { margin-bottom: 1.5rem; }
+.log-title .eyebrow { margin-bottom: 0.6rem; }
+.log-title h1 { overflow-wrap: anywhere; font-family: var(--mono); font-size: clamp(1.4rem, 3vw, 2.4rem); font-weight: 700; line-height: 1.2; letter-spacing: -0.04em; }
+.job-output + .job-output { margin-top: 2.5rem; }
+.job-output .notice h2 { font-size: 1.5rem; }
+.output-wait { padding: 1.2rem 1.4rem; border: 1px solid var(--line-strong); background: var(--paper); }
+.output-wait > p { margin-bottom: 0.75rem; }
+.output-wait .tail-account { color: var(--muted); font-size: 0.78rem; }
+.output-details { margin-top: 3rem; }
+.output-details h2 { margin-bottom: 1rem; font-size: 1.4rem; }
+.output-details > p { max-width: 80ch; margin-bottom: 1rem; color: var(--muted); font-size: 0.78rem; }
+.output-details > .unclosed-note { color: var(--unavailable); }
 .log-frame { border: 1px solid var(--terminal); background: var(--terminal); color: var(--terminal-text); }
 .log-toolbar { position: sticky; z-index: 3; top: 0; display: flex; align-items: center; justify-content: space-between; gap: 2rem; min-height: 4rem; padding: 0 1.2rem; border-bottom: 1px solid #354549; background: var(--terminal); }
 .log-toolbar > div:first-child { display: grid; gap: 0.15rem; }
@@ -289,7 +281,17 @@ tbody tr:last-child td { border-bottom: 0; }
   background: var(--terminal); color: var(--terminal-text); font: 0.78rem/1.58 var(--mono); overflow-wrap: anywhere; tab-size: 4; white-space: pre-wrap;
 }
 .log-output.preserve-columns { overflow-wrap: normal; white-space: pre; }
+.log-output:empty { min-height: 0; padding: 0; }
 .log-end-marker { display: block; height: 1px; }
+.log-empty { margin: 0; padding: 1rem 1.4rem; color: var(--terminal-muted); }
+.log-annotation { padding: 0.85rem 1.4rem; border-top: 1px solid #354549; color: var(--terminal-muted); font-size: 0.75rem; }
+.log-annotation p, .tail-account p { margin: 0; }
+.log-annotation p + p, .tail-account p + p { margin-top: 0.4rem; }
+.log-annotation code { overflow-wrap: anywhere; }
+.log-annotation strong { color: var(--terminal-text); }
+.log-annotation .claim-observed { color: #8ed2cc; }
+.log-annotation .claim-unavailable { color: #dfbd7b; }
+.log-annotation .text-action, .output-wait .text-action { margin-top: 0.5rem; font-size: 0.75rem; }
 
 @media (max-width: 70rem) {
   .head-inner { grid-template-columns: 1fr auto; }
@@ -310,7 +312,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .claim-key > span:not(.claim) { display: none; }
   .page { padding-top: 3rem; }
   h1 { font-size: 3.1rem; }
-  .page-intro, .record-title, .log-title { grid-template-columns: 1fr; gap: 2rem; }
+  .page-intro, .record-title { grid-template-columns: 1fr; gap: 2rem; }
   .scope-account { max-width: 24rem; }
   .section-heading { align-items: flex-start; flex-direction: column; }
   .section-heading > p { text-align: left; }
@@ -325,8 +327,8 @@ tbody tr:last-child td { border-bottom: 0; }
   .run-table td, .run-table td:first-child, .run-table td:nth-child(3), .run-table td:last-child { min-width: 0; width: auto; padding: 0; border: 0; }
   .run-table td::before { display: block; margin-bottom: 0.35rem; color: var(--muted); content: attr(data-label); font-size: 0.58rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
   .run-table td:nth-child(2) { grid-column: 1 / -1; grid-row: 1; }
-  .record-title > .status-account, .log-title > .claim { justify-self: start; margin-top: 0; }
-  .claim-account, .log-custody { padding-inline: 1.2rem; }
+  .record-title > .status-account { justify-self: start; margin-top: 0; }
+  .claim-account { padding-inline: 1.2rem; }
   .record-facts, .log-facts, .event-facts { grid-template-columns: 1fr; }
   .fact, .record-facts .fact, .log-facts .fact, .event-facts .fact { border-top: 1px solid var(--line); border-right: 0; }
   .fact:first-child { border-top: 0; }
@@ -340,8 +342,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .topology-panel { padding: 1rem; }
   .topology-stage { height: var(--topology-height, 30rem); }
   .topology-canvas { min-width: 80rem; }
-  .attempt-boundary, .observed-exit, .job-account { grid-template-columns: 1fr; gap: 0.5rem; }
-  .observed-exit .text-action { justify-self: start; }
+  .job-account { grid-template-columns: 1fr; gap: 0.5rem; }
   .dag-node { grid-template-columns: 3rem minmax(0, 1fr); padding: 0.7rem 0; }
   .dag-kind { grid-column: 2; }
   .log-toolbar { align-items: stretch; flex-direction: column; gap: 0; padding-top: 0.9rem; }
