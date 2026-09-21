@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { Link, Navigate, Route, Routes, useParams } from "react-router-dom";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 import type { Core, ElementDefinition, StylesheetJson } from "cytoscape";
 import {
   ApiError, ShapeError, containerOf, fetchDag, fetchRun, fetchRuns,
@@ -578,21 +581,61 @@ function LogSurface({ text, label, caption, annotation, startAtEnd = false }: {
   text: string; label: string; caption?: ReactNode; annotation?: ReactNode; startAtEnd?: boolean;
 }) {
   const [copyState, setCopyState] = useState("Copy exact text");
-  const [wrap, setWrap] = useState(true);
-  const frame = useRef<HTMLDivElement>(null);
-  const end = useRef<HTMLSpanElement>(null);
+  const mount = useRef<HTMLDivElement>(null);
+  const terminal = useRef<Terminal | null>(null);
+  const previousText = useRef("");
   const placed = useRef(false);
   const bytes = useMemo(() => new TextEncoder().encode(text).length, [text]);
   const lines = useMemo(() => text ? text.split("\n").length - (text.endsWith("\n") ? 1 : 0) : 0, [text]);
   useEffect(() => {
-    if (startAtEnd && text && !placed.current) {
-      const timer = window.setTimeout(() => {
+    if (!mount.current) return;
+    const term = new Terminal({
+      convertEol: true,
+      disableStdin: true,
+      fontFamily: 'ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace',
+      fontSize: 12.5,
+      lineHeight: 1.45,
+      screenReaderMode: true,
+      scrollback: 5_000,
+      theme: {
+        background: "#0d1518",
+        foreground: "#e7efec",
+        cursor: "#0d1518",
+        selectionBackground: "#354549",
+      },
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(mount.current);
+    fit.fit();
+    terminal.current = term;
+    const observer = new ResizeObserver(() => fit.fit());
+    observer.observe(mount.current);
+    return () => {
+      observer.disconnect();
+      terminal.current = null;
+      previousText.current = "";
+      placed.current = false;
+      term.dispose();
+    };
+  }, []);
+  useEffect(() => {
+    const term = terminal.current;
+    if (!term) return;
+    term.options.scrollback = Math.min(500_000, Math.max(5_000, lines + term.rows));
+    const append = text.startsWith(previousText.current)
+      ? text.slice(previousText.current.length)
+      : text;
+    if (!text.startsWith(previousText.current)) term.reset();
+    previousText.current = text;
+    if (!append) return;
+    term.write(append, () => {
+      if (terminal.current === term && startAtEnd && !placed.current) {
         placed.current = true;
-        end.current?.scrollIntoView({ block: "center" });
-      }, 100);
-      return () => window.clearTimeout(timer);
-    }
-  }, [startAtEnd, text]);
+        term.scrollToBottom();
+      }
+    });
+  }, [lines, startAtEnd, text]);
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(text);
@@ -600,11 +643,11 @@ function LogSurface({ text, label, caption, annotation, startAtEnd = false }: {
       window.setTimeout(() => setCopyState("Copy exact text"), 1_500);
     } catch { setCopyState("Copy unavailable"); }
   };
-  return <div className="log-frame" ref={frame}>
+  return <div className="log-frame">
     <div className="log-toolbar"><div><span>{label}</span>{caption ? <small aria-live="polite">{caption}</small> : null}<small>{lines} lines · {bytesLabel(bytes)}{startAtEnd ? " · opened at end" : ""}</small></div>
-      <div className="log-actions"><button type="button" onClick={() => frame.current?.scrollIntoView({ block: "start" })}>Beginning</button><button type="button" onClick={() => end.current?.scrollIntoView({ block: "center" })}>End</button><button type="button" aria-pressed={!wrap} onClick={() => setWrap((value) => !value)}>{wrap ? "Preserve columns" : "Wrap lines"}</button><button type="button" onClick={() => void copy()}>{copyState}</button></div>
+      <div className="log-actions"><button type="button" onClick={() => terminal.current?.scrollToTop()}>Beginning</button><button type="button" onClick={() => terminal.current?.scrollToBottom()}>End</button><button type="button" onClick={() => void copy()}>{copyState}</button></div>
     </div>
-    <pre className={`log-output ${wrap ? "" : "preserve-columns"}`} tabIndex={0} aria-label={label}>{text}</pre><span ref={end} className="log-end-marker" aria-hidden="true" />
+    <div className="log-terminal" ref={mount} aria-label={label} />
     {text === "" ? <p className="log-empty" role="status">The response contained no output.</p> : null}
     {annotation ? <div className="log-annotation">{annotation}</div> : null}
   </div>;

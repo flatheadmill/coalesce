@@ -33,7 +33,7 @@ button, input { font: inherit; }
 button { color: inherit; }
 a { color: inherit; text-decoration-color: var(--line-strong); text-decoration-thickness: 1px; text-underline-offset: 0.22em; }
 a:hover { text-decoration-color: currentColor; }
-a:focus-visible, button:focus-visible, input:focus-visible, .log-output:focus-visible {
+a:focus-visible, button:focus-visible, input:focus-visible, .log-terminal:focus-within {
   outline: 3px solid var(--observed); outline-offset: 3px;
 }
 code, time, .numeric, .age-value { font-family: var(--mono); font-variant-numeric: tabular-nums; }
@@ -287,13 +287,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .log-actions { display: flex; align-items: stretch; min-height: 4rem; }
 .log-actions button { padding: 0 1rem; border: 0; border-left: 1px solid #354549; background: transparent; color: var(--terminal-text); cursor: pointer; font-size: 0.72rem; }
 .log-actions button:hover { background: #1b292d; }
-.log-output {
-  width: 100%; min-height: 20rem; margin: 0; overflow-x: auto; overflow-y: visible; padding: 1.25rem 1.4rem 2rem;
-  background: var(--terminal); color: var(--terminal-text); font: 0.78rem/1.58 var(--mono); overflow-wrap: anywhere; tab-size: 4; white-space: pre-wrap;
-}
-.log-output.preserve-columns { overflow-wrap: normal; white-space: pre; }
-.log-output:empty { min-height: 0; padding: 0; }
-.log-end-marker { display: block; height: 1px; }
+.log-terminal { width: 100%; height: min(65vh, 42rem); min-height: 20rem; padding: 1.25rem 1.4rem; }
+.log-terminal .xterm { height: 100%; }
+.log-terminal .xterm-viewport, .log-terminal .xterm-screen { background: var(--terminal) !important; }
 .log-empty { margin: 0; padding: 1rem 1.4rem; color: var(--terminal-muted); }
 .log-annotation { padding: 0.85rem 1.4rem; border-top: 1px solid #354549; color: var(--terminal-muted); font-size: 0.75rem; }
 .log-annotation p, .tail-account p { margin: 0; }
@@ -360,7 +356,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .log-toolbar { align-items: stretch; flex-direction: column; gap: 0; padding-top: 0.9rem; }
   .log-actions { display: grid; grid-template-columns: 1fr 1fr; margin-inline: -1.2rem; margin-top: 0.8rem; border-top: 1px solid #354549; }
   .log-actions button { min-height: 2.75rem; border-bottom: 1px solid #354549; }
-  .log-output { min-height: 22rem; padding-inline: 1rem; }
+  .log-terminal { height: 60vh; min-height: 22rem; padding-inline: 1rem; }
   .site-foot > div { align-items: flex-start; flex-direction: column; gap: 0.5rem; }
 }
 
