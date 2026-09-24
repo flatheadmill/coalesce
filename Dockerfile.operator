@@ -1,0 +1,13 @@
+# The operator only translates readable source to a ConfigMap. No shell,
+# executor, server assets or cluster credentials are baked into this image.
+FROM golang:1.24-alpine AS builder
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/operator/ ./cmd/operator/
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o coalesce-operator ./cmd/operator
+
+FROM scratch
+COPY --from=builder /build/coalesce-operator /coalesce-operator
+USER 65532:65532
+ENTRYPOINT ["/coalesce-operator"]

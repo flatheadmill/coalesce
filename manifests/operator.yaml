@@ -1,0 +1,74 @@
+# Portable namespaced deployment. Install manifests/crd.yaml first, create
+# namespace coalesce, and build/publish the image named below before applying.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coalesce-operator
+  namespace: coalesce
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coalesce-operator
+  namespace: coalesce
+rules:
+- apiGroups: [coalesce.flatheadmill.com]
+  resources: [coalesces]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [configmaps]
+  verbs: [get, list, watch, create, update, patch]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coalesce-operator
+  namespace: coalesce
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coalesce-operator
+subjects:
+- kind: ServiceAccount
+  name: coalesce-operator
+  namespace: coalesce
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coalesce-operator
+  namespace: coalesce
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: coalesce-operator
+  template:
+    metadata:
+      labels:
+        app: coalesce-operator
+    spec:
+      serviceAccountName: coalesce-operator
+      containers:
+      - name: operator
+        image: ghcr.io/flatheadmill/coalesce-operator:latest
+        imagePullPolicy: Always
+        env:
+        - name: WATCH_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+          seccompProfile:
+            type: RuntimeDefault

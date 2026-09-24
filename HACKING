@@ -65,18 +65,22 @@ that is yours to run is the namespace, described at the bottom of this file.
 
 Deploying
 
-Build the images — the server, the receiver, and the dispatch image that
-receiver-created pipelines run. OrbStack makes locally built images visible
+Build the images — server, receiver, source operator, and the dispatch image
+that receiver-created pipelines run. OrbStack makes locally built images visible
 to its cluster: no registry, no push, no pull secret.
 
     docker build -t coalesce-web .
     docker build -f Dockerfile.receiver -t coalesce-receiver .
+    docker build -f Dockerfile.operator -t coalesce-operator .
     docker build -f Dockerfile.dispatch -t coalesce-dispatch .
 
-Apply the local manifests — namespace, PostgreSQL, server, receiver, in one
-pass — then mint the webhook secret the receiver waits on, from a throwaway
+Install the CRD, then apply the local manifests — namespace, PostgreSQL,
+server, receiver, operator — and mint the webhook secret from a throwaway
 value that matters to nobody:
 
+    kubectl --context orbstack apply -f manifests/crd.yaml
+    kubectl --context orbstack wait --for=condition=Established \
+        crd/coalesces.coalesce.flatheadmill.com --timeout=60s
     kubectl --context orbstack apply -f manifests/local/
     kubectl --context orbstack -n coalesce create secret generic coalesce-webhook \
         --from-literal=secret=local-webhook-secret \
@@ -86,7 +90,9 @@ This creates the coalesce namespace; a PostgreSQL Deployment with its data on
 a PVC; the server with its ServiceAccount, namespaced RBAC for pod log
 access, a PVC for log storage, and a Service named coalesce; and the receiver
 with its own ServiceAccount and namespaced RBAC (watch ConfigMaps, create
-Jobs). The server and PostgreSQL carry strategy Recreate on purpose — on one
+Jobs). The operator has its own ServiceAccount and namespaced RBAC to read
+Coalesce resources, reconcile ConfigMaps, and record Events; it cannot create
+Jobs. The server and PostgreSQL carry strategy Recreate on purpose — on one
 node, ReadWriteOnce guards nothing, and a rolling update would run two
 servers (stale-looking UI at exactly the wrong moment) or two postmasters (a
 crash-looping database). The receiver pod waits in
@@ -145,6 +151,137 @@ With zshctl, gojq, bsdtar, and gzip on PATH, run:
 This checks reproducibility across checkout timestamps, preserved source and
 executable permissions, content changes, and archive failures. It runs locally
 without Kubernetes access.
+
+---
+
+The Source Operator
+
+The operator accepts readable Coalesce resources and produces the same
+ConfigMap that make produces from a directory. These are different source
+forms even though they share apiVersion and kind: make still reads the
+descriptor's outer metadata and archives the directory; the operator reads
+spec.configMapMetadata and spec.files. Do not feed the cluster resource to
+make. The receiver and the pods continue to consume ConfigMaps.
+
+The source's outer metadata belongs to its deployment tool. Only
+spec.configMapMetadata.labels and annotations go to the child. Its name and
+namespace match the source. Existing direct ConfigMaps are never adopted,
+and an old source UID is not interchangeable with a new resource of the
+same name. No migration is hidden in reconciliation.
+
+Run the Go tests and the two-producer proof without a cluster:
+
+    go test ./...
+    go test -race ./cmd/operator
+    go test -tags=integration ./cmd/operator
+    zsh test/make.test.zsh
+
+The integration test invokes make and bsdtar and compares extracted hello
+and library trees, file modes, child metadata, and templates. It needs the
+same local tools as the make test. The fixtures explicitly include their
+old coalesce.yaml as a file so the extracted trees are equal; the operator
+never invents that file. It writes regular USTAR files only, in sorted order,
+with 0644 or 0755 modes. Paths that USTAR cannot encode, duplicate paths,
+unclean paths, and file/ancestor collisions are rejected. Body bytes,
+including the last newline, are preserved.
+
+After deploying locally, use test/hello.coalesce.yaml and
+test/library.coalesce.yaml for the live proof. If you previously ran the
+direct-ConfigMap example below, first inspect its hello/library ConfigMaps.
+For those known test fixtures, make the handoff explicitly:
+
+    kubectl --context orbstack -n coalesce get configmap hello library
+    kubectl --context orbstack -n coalesce delete configmap hello library
+
+Keep a separate direct library to prove coexistence, then apply the readable
+sources:
+
+    ./bin/coalesce make test/library | \
+        gojq --yaml-input --yaml-output '.metadata.name = "direct-library"' | \
+        kubectl --context orbstack apply -f -
+    kubectl --context orbstack apply -f test/library.coalesce.yaml -f test/hello.coalesce.yaml
+    kubectl --context orbstack -n coalesce get coalesce,configmap hello \
+        -o 'custom-columns=KIND:.kind,NAME:.metadata.name,GENERATION:.metadata.generation,RENDERED:.metadata.annotations.coalesce\.flatheadmill\.com/rendered-generation,OWNER:.metadata.ownerReferences[0].uid'
+
+Wait until the child exists and its rendered generation matches the source.
+The reserved coalesce.flatheadmill.com/rendered-generation annotation and the
+owner-reference UID identify the source that produced the artifact. An
+authored value for that annotation is rejected. This is evidence of rendering,
+not receiver acceptance or a successful run.
+
+Inspect the actual archive and the child owner reference:
+
+    kubectl --context orbstack -n coalesce get configmap hello \
+        -o jsonpath='{.binaryData.ball\.tar\.gz}' | base64 -d | bsdtar -tvf -
+    kubectl --context orbstack -n coalesce get configmap hello -o yaml
+
+Two different failures expose the two different owners. First give the
+operator a tree it cannot extract:
+
+    kubectl --context orbstack -n coalesce patch coalesce hello --type=merge \
+        -p '{"spec":{"files":[{"path":"../escape","body":"bad"}]}}'
+    kubectl --context orbstack -n coalesce describe coalesce hello
+
+The ConfigMap's bytes and rendered generation must remain unchanged. The
+operator emits an InvalidSource Warning on the Coalesce resource and logs
+that the existing artifact was left in place. Restore the files, then give
+the receiver a template with an unknown field:
+
+    kubectl --context orbstack apply -f test/hello.coalesce.yaml
+    kubectl --context orbstack -n coalesce patch coalesce hello --type=merge \
+        -p '{"spec":{"template":{"spec":{"unknownPodField":true}}}}'
+    kubectl --context orbstack -n coalesce get configmap hello \
+        -o jsonpath='{.data.template\.yaml}'
+    kubectl --context orbstack -n coalesce logs deployment/coalesce-receiver --tail=20
+
+The unknown field must survive CRD admission and rendering, and the rendered
+generation must advance. The receiver's existing strict decode rejects it
+and removes this claim from its cache. Its log explains the refusal. There
+is no receiver Event or acceptance marker in this level. Send the synthetic
+delivery from the Receiver section: after that refusal it returns no run.
+Remove the bad field explicitly (it was added outside the apply manifest):
+
+    kubectl --context orbstack -n coalesce patch coalesce hello --type=json \
+        -p '[{"op":"remove","path":"/spec/template/spec/unknownPodField"}]'
+
+After the artifact catches up and the receiver logs Pipeline cached, send
+another synthetic delivery and observe the Job complete with hello, world.
+The operator proves that the artifact matches its source. The delivery and
+Job provide the evidence about dispatch and execution. An empty template
+also passes through; Kubernetes can still reject the resulting Job.
+
+Exercise CRD defaults by removing executable from a library file and reading
+it back; the API should default it to false:
+
+    kubectl --context orbstack -n coalesce patch coalesce library --type=json \
+        -p '[{"op":"remove","path":"/spec/files/0/executable"}]'
+    kubectl --context orbstack -n coalesce get coalesce library -o yaml
+
+Delete the hello resource and observe garbage collection, while the direct
+library remains:
+
+    kubectl --context orbstack -n coalesce delete coalesce hello
+    kubectl --context orbstack -n coalesce wait --for=delete configmap/hello --timeout=60s
+    kubectl --context orbstack -n coalesce get configmap direct-library
+
+Finally, use the OrbStack-only kubeconfig from Running a Pipeline and apply
+the hello resource through kapp twice:
+
+    kapp --kubeconfig /tmp/orbstack.kubeconfig deploy -n coalesce \
+        -a coalesce-operator-proof -f test/hello.coalesce.yaml
+    kapp --kubeconfig /tmp/orbstack.kubeconfig deploy -n coalesce \
+        -a coalesce-operator-proof -f test/hello.coalesce.yaml
+
+The second diff must not claim or propose deletion of the generated child.
+Fake clients cannot prove CRD pruning/defaulting, owner-reference admission,
+garbage collection, or this kapp ownership behavior; those remain live
+checks even when every local test passes.
+
+For a portable installation, manifests/operator.yaml has the same RBAC and
+binary with a registry image name. Create its coalesce namespace, install
+manifests/crd.yaml, and publish or substitute that image before applying the
+operator manifest. manifests/example-pipeline.yaml is a standalone example.
+This does not migrate any Acres resource or publish an image by itself.
 
 ---
 
@@ -317,14 +454,16 @@ Layout
     cmd/web/main.go                 Go server
     cmd/web/migrations/             Database schema
     cmd/receiver/                   Webhook receiver
+    cmd/operator/                   Readable source to ConfigMap controller
     run.html                        Old UI prototype (served at /run.html)
     test/                           Pipeline test definitions
     studio/two/                     Product UI (Vite, React, TypeScript)
     studio/                         UI package, shared transport, and exhibits
     manifests/local/                The local environment (this file's subject)
-    manifests/                      Older manifests, kept beside
+    manifests/                      CRD, portable operator, and older manifests
     Dockerfile                      Server image
     Dockerfile.receiver             Receiver image
+    Dockerfile.operator             Static source operator image
     Dockerfile.dispatch             Local dispatch image (zsh, tini, zshctl)
 
 ---

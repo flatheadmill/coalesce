@@ -1,4 +1,4 @@
-Coalesce is a pipeline executor for Kubernetes. The Zsh executor orchestrates — it builds DAGs, creates Jobs, watches completion, propagates state. The Go server observes and records — metadata to PostgreSQL, logs to buckets, events to UI via WebSocket. The receiver verifies GitHub deliveries and dispatches them through pipeline ConfigMaps. The executor doesn't need the server to run a pipeline. The server doesn't orchestrate.
+Coalesce is a pipeline executor for Kubernetes. The Zsh executor orchestrates — it builds DAGs, creates Jobs, watches completion, propagates state. The Go server observes and records — metadata to PostgreSQL, logs to buckets, events to UI via WebSocket. The receiver verifies GitHub deliveries and dispatches them through pipeline ConfigMaps. The source operator turns readable Coalesce resources into those ConfigMaps; direct ConfigMaps remain supported. The executor doesn't need the server to run a pipeline. The server doesn't orchestrate.
 
 ---
 
@@ -25,6 +25,7 @@ share/coalesce/commands/        Executor commands (run/command.zsh is the event 
 cmd/web/main.go                 Go server
 cmd/web/migrations/             Database schema
 cmd/receiver/                   Webhook receiver
+cmd/operator/                   Readable source to ConfigMap controller
 studio/two/                     Product UI (Vite, React, TypeScript)
 studio/                         UI package, shared transport, and exhibits
 run.html                        Old UI prototype (served at /run.html)
@@ -32,5 +33,6 @@ test/                           Pipeline test definitions
 manifests/local/                The local environment
 Dockerfile                      Server image (builds and embeds the UI)
 Dockerfile.receiver             Receiver image
+Dockerfile.operator             Static source operator image
 Dockerfile.dispatch             Local dispatch image (zsh, tini, zshctl)
 ```
