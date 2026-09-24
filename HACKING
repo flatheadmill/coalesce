@@ -149,8 +149,8 @@ With zshctl, gojq, bsdtar, and gzip on PATH, run:
     zsh test/make.test.zsh
 
 This checks reproducibility across checkout timestamps, preserved source and
-executable permissions, content changes, and archive failures. It runs locally
-without Kubernetes access.
+executable permissions, content changes, archive failures, and rejection of
+live cluster-resource inputs. It runs locally without Kubernetes access.
 
 ---
 
@@ -160,8 +160,11 @@ The operator accepts readable Coalesce resources and produces the same
 ConfigMap that make produces from a directory. These are different source
 forms even though they share apiVersion and kind: make still reads the
 descriptor's outer metadata and archives the directory; the operator reads
-spec.configMapMetadata and spec.files. Do not feed the cluster resource to
-make. The receiver and the pods continue to consume ConfigMaps.
+spec.configMapMetadata and spec.files. make rejects a descriptor containing
+either of those fields, including null or empty values, before emitting any
+ConfigMap in the batch. CRD admission requires spec.files and therefore
+rejects a directory descriptor. The receiver and the pods continue to consume
+ConfigMaps.
 
 The source's outer metadata belongs to its deployment tool. Only
 spec.configMapMetadata.labels and annotations go to the child. Its name and
@@ -264,15 +267,58 @@ library remains:
     kubectl --context orbstack -n coalesce wait --for=delete configmap/hello --timeout=60s
     kubectl --context orbstack -n coalesce get configmap direct-library
 
-Finally, use the OrbStack-only kubeconfig from Running a Pipeline and apply
-the hello resource through kapp twice:
+Finally, prove the ownership handoff itself. Start after the hello resource
+and its child have been deleted above. Use the OrbStack-only kubeconfig from
+Running a Pipeline. First make kapp own a directly rendered hello ConfigMap:
+
+    ./bin/coalesce make test/hello > /tmp/coalesce-operator-proof-direct.yaml
+    kapp --kubeconfig /tmp/orbstack.kubeconfig deploy -n coalesce \
+        -a coalesce-operator-proof -f /tmp/coalesce-operator-proof-direct.yaml
+    direct_uid=$(kubectl --context orbstack -n coalesce get configmap hello -o jsonpath='{.metadata.uid}')
+    kubectl --context orbstack -n coalesce get configmap hello \
+        -o jsonpath='{.metadata.labels.kapp\.k14s\.io/app}'
+
+Confirm the kapp app label is present. In a second terminal, start a watch
+and wait for the initial ADDED event with that direct ConfigMap's UID before
+continuing. Keep this watch running through the handoff and its test delivery:
+
+    kubectl --context orbstack -n coalesce get configmap hello \
+        --watch --output-watch-events -o json > /tmp/coalesce-operator-proof-watch.json
+
+Replace the app's ConfigMap input with the same-named Coalesce resource in
+one deploy. Do not manually delete the ConfigMap between these two kapp
+invocations; kapp must perform its own removal while the operator converges:
 
     kapp --kubeconfig /tmp/orbstack.kubeconfig deploy -n coalesce \
         -a coalesce-operator-proof -f test/hello.coalesce.yaml
-    kapp --kubeconfig /tmp/orbstack.kubeconfig deploy -n coalesce \
-        -a coalesce-operator-proof -f test/hello.coalesce.yaml
 
-The second diff must not claim or propose deletion of the generated child.
+The diff should remove the direct ConfigMap and add the Coalesce resource.
+The source may initially report an ownership collision. After kapp removes
+the old object, the operator must create a new child during this deploy.
+Wait for matching source/rendered generations and inspect the new owner:
+
+    source_uid=$(kubectl --context orbstack -n coalesce get coalesce hello -o jsonpath='{.metadata.uid}')
+    replacement_uid=$(kubectl --context orbstack -n coalesce get configmap hello -o jsonpath='{.metadata.uid}')
+    [[ $direct_uid != $replacement_uid ]]
+    kubectl --context orbstack -n coalesce get configmap hello -o json | \
+        gojq -e --arg owner "$source_uid" \
+        'any(.metadata.ownerReferences[]; .controller == true and .uid == $owner) and (.metadata.labels | has("kapp.k14s.io/app") | not)'
+
+Redeliver the synthetic payload and observe the hello Job complete. A delivery
+in the interval without a receiver claim may need this redelivery. Stop the
+watch with Ctrl-C, then check the whole trace, not just the final ConfigMap:
+
+    gojq -se --arg old "$direct_uid" --arg replacement "$replacement_uid" \
+        '([.[] | select(.type == "DELETED") | .object.metadata.uid] == [$old]) and any(.[]; .type == "ADDED" and .object.metadata.uid == $replacement)' \
+        /tmp/coalesce-operator-proof-watch.json
+
+Only the original UID may have a DELETED event. A deletion of an
+operator-created replacement fails the handoff proof even if the operator
+recreates it and the final state looks healthy. Finally, apply the unchanged
+resource once more through the same kapp app; that diff must neither claim
+nor propose deletion of the generated child. This last apply proves steady
+state; it cannot substitute for the one-deploy handoff.
+
 Fake clients cannot prove CRD pruning/defaulting, owner-reference admission,
 garbage collection, or this kapp ownership behavior; those remain live
 checks even when every local test passes.

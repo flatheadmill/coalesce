@@ -30,6 +30,31 @@ tmp=$(mktemp -d)
         $(gojq --yaml-input --yaml-output '.spec.template' < $tmp/first/hello/coalesce.yaml) ]]
     gojq --yaml-input -e 'select(.metadata.name == "library") | .data == null' < $tmp/first.yaml > /dev/null
 
+    # A live resource can share the descriptor's GVK without being a valid
+    # directory input. Preflight the entire batch before printing anything.
+    mkdir -p $tmp/resource
+    function reject_cluster_resource {
+        if $root/bin/coalesce make $tmp/first/hello $tmp/resource > $tmp/resource.yaml 2> $tmp/resource.err; then
+            print -u 2 'a live cluster resource must not be rendered as a directory descriptor'
+            false
+        fi
+        [[ ! -s $tmp/resource.yaml ]]
+        [[ $(<$tmp/resource.err) = *'live cluster-resource shape'* ]]
+    }
+    typeset fixture field value
+    for fixture in hello library; do
+        cp $root/test/$fixture.coalesce.yaml $tmp/resource/coalesce.yaml
+        reject_cluster_resource
+    done
+    # Either field is sufficient, even if its value is null or empty.
+    for field in files configMapMetadata; do
+        for value in null '{}' '[]'; do
+            gojq --yaml-input --yaml-output --arg field $field --argjson value $value \
+                '.spec[$field] = $value' < $root/test/hello/coalesce.yaml > $tmp/resource/coalesce.yaml
+            reject_cluster_resource
+        done
+    done
+
     printf '# changed content\n' >> $tmp/second/hello/run
     $root/bin/coalesce make $tmp/second/hello $tmp/second/library > $tmp/changed.yaml
     if cmp -s $tmp/first.yaml $tmp/changed.yaml; then
@@ -53,7 +78,7 @@ tmp=$(mktemp -d)
     [[ $(<$tmp/failed.err) = *'unable to archive'* ]]
     typeset leftovers=( $tmp/staging/*(ND) )
     (( ! ${#leftovers} ))
-    print 'coalesce make reproducibility checks passed'
+    print 'coalesce make reproducibility and input-shape checks passed'
 } always {
     rm -rf $tmp
 }

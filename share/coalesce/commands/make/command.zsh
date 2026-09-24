@@ -13,9 +13,9 @@ function :args:make {
 # of what either artifact does. The descriptor rides inside the archive too,
 # which costs nothing and leaves the artifact able to describe itself.
 #
-# The key is ball.tar.gz for every source, pipeline or library. This is the one
-# renderer and it stamps the one name a pod template can mount and unpack — the
-# loop is closed, so there is no second producer to accommodate.
+# The key is ball.tar.gz for every source, pipeline or library. Both this
+# directory renderer and the cluster operator produce that same artifact.
+# The operator's live resource shape is not a directory descriptor.
 #
 # binaryData is printed rather than rendered, because a YAML writer is entitled
 # to fold a long scalar and Kubernetes will not accept a folded base64 payload.
@@ -27,9 +27,13 @@ function :args:make {
 # arriving as AppleDouble files.
 function :execute:make {
     setopt localoptions pipefail
-    typeset file separator= files=( "$@" )
+    typeset file cluster_resource separator= files=( "$@" )
     for file in "${(@)files}"; do
         [[ -e $file/coalesce.yaml ]] || abend 'not a coalesce directory'
+        cluster_resource=$(gojq --yaml-input '(.spec // {}) | has("files") or has("configMapMetadata")' < $file/coalesce.yaml) ||
+            abend 'unable to read descriptor `%s/coalesce.yaml`' $file
+        [[ $cluster_resource != true ]] ||
+            abend '`%s/coalesce.yaml` contains spec.files or spec.configMapMetadata: this is the live cluster-resource shape; apply it to Kubernetes instead of passing it to coalesce make' $file
     done
     for file in "${(@)files}"; do
         printf '%s' "$separator"
