@@ -1,4 +1,4 @@
-# The server image carries Two: the node stage builds studio/two, then its
+# The server image carries Four: the node stage builds studio/four, then its
 # output is copied where cmd/web's go:embed expects it — one image, one
 # artifact, with the same UI source used by the local Vite loop.
 FROM node:22-alpine AS ui
@@ -7,7 +7,7 @@ WORKDIR /build/studio
 COPY studio/package.json studio/package-lock.json ./
 RUN npm ci --no-fund --no-audit
 COPY studio/ ./
-RUN npm run build:two
+RUN npm run build:four
 
 FROM golang:1.24-alpine AS builder
 
@@ -15,7 +15,7 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ ./cmd/
-COPY --from=ui /build/studio/dist/two ./cmd/web/dist
+COPY --from=ui /build/studio/dist/four ./cmd/web/dist
 RUN CGO_ENABLED=0 GOOS=linux go build -o coalesce ./cmd/web
 
 FROM alpine:latest

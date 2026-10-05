@@ -54,8 +54,8 @@ var (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-// Two rides in the binary, embedded and versioned with the server. The
-// Dockerfile builds studio/two with build:two and copies studio/dist/two
+// Four rides in the binary, embedded and versioned with the server. The
+// Dockerfile builds studio/four with build:four and copies studio/dist/four
 // into cmd/web/dist. A bare `go build ./cmd/web` compiles with the tracked
 // placeholder; follow HACKING to include the app in a local Go build.
 //

@@ -1,12 +1,17 @@
 **Coalesce Design Studio**
 
-The studio holds three presentations of one Coalesce specimen. Two (`two/`) is also the product UI embedded in the Coalesce server. Its source serves both the local Vite loop and the shipped app. The backend and its data contract stay fixed while exhibits `one`, `two`, and `three` are allowed to reach independent conclusions about the interface.
+The studio holds three original presentations of one Coalesce specimen and a later fourth cut. Four (`four/`) is also the product UI embedded in the Coalesce server. Its source serves both the local Vite loop and the shipped app. The backend and its data contract stay fixed while the exhibits are allowed to reach independent conclusions about the interface.
 
 The exhibits share the runs, run, and log routes; live reads from the current API; run events and log tails; and honest loading, empty, and error states. Their methods and receipts describe the individual designs and their state of completion. Representative fixtures live beside the transport for visual work, but the apps do not silently fall back to them when the backend fails.
 
 The only shared browser code is `shared/api.ts` and `shared/fixtures.ts`. An exhibit does not import another exhibit, and the studio has no shared components, CSS, tokens, layout shell, or aesthetic vocabulary. Repetition across the three apps is the cost of preserving their freedom to diverge.
 
 **Working With An Exhibit**
+
+Four (`four/`) is a later daily-developer cut, with its own
+[brief and method](four/method.md). It carries forward the DAG and output work
+while putting the result and terminal first. The original three cuts remain
+preserved; Four's brief deliberately permits assembling their useful behavior.
 
 Install once in `studio/` with Node 22.12 or newer, then choose an exhibit. Each Vite server proxies `/api`, `/events`, and `/tail` to `http://coalesce.coalesce.svc.cluster.local` by default. Set `COALESCE_DEV_UPSTREAM` to use another backend.
 
@@ -15,24 +20,26 @@ npm ci
 npm run dev:one
 npm run dev:two
 npm run dev:three
+npm run dev:four
 ```
 
-The development ports are 5171, 5172, and 5173. Every app starts at `/coalesce/runs`; the namespace remains part of the browser route and can be changed directly in the URL.
+The development ports are 5171, 5172, 5173, and 5174. Every app starts at `/coalesce/runs`; the namespace remains part of the browser route and can be changed directly in the URL.
 
 **Building**
 
-Each build has its own type check and output identity under `dist/`. `build:two` produces the product UI in `dist/two`; the aggregate command builds all three exhibits. These commands leave the Go embed directory untouched.
+Each build has its own type check and output identity under `dist/`. `build:four` produces the product UI in `dist/four`; the aggregate command builds all four exhibits. These commands leave the Go embed directory untouched. The studio container continues to serve the original three.
 
 ```bash
 npm run build:one
 npm run build:two
 npm run build:three
+npm run build:four
 npm run build
 ```
 
 **Server Image**
 
-The root Dockerfile installs this package, runs `build:two`, and copies `dist/two` into `cmd/web/dist` before compiling the Go server. The resulting binary embeds Two and serves its assets and browser routes alongside the API and WebSockets. HACKING documents the ordinary server build and the equivalent build-and-copy steps for a local Go binary. There is no copied production source or separate UI deployment.
+The root Dockerfile installs this package, runs `build:four`, and copies `dist/four` into `cmd/web/dist` before compiling the Go server. The resulting binary embeds Four and serves its assets and browser routes alongside the API and WebSockets. HACKING documents the ordinary server build and the equivalent build-and-copy steps for a local Go binary. There is no copied production source or separate UI deployment.
 
 **Studio Container**
 
