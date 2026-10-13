@@ -10,6 +10,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+func TestTailContainer(t *testing.T) {
+	for _, test := range []struct {
+		name, requested string
+		containers      []corev1.Container
+		want            string
+	}{
+		{"step alias", "storybook", []corev1.Container{{Name: "build"}}, "build"},
+		{"exact name", "build", []corev1.Container{{Name: "build"}, {Name: "postgres"}}, "build"},
+		{"no name", "", []corev1.Container{{Name: "build"}}, "build"},
+		{"ambiguous alias", "storybook", []corev1.Container{{Name: "build"}, {Name: "postgres"}}, ""},
+		{"wrong name", "missing", []corev1.Container{{Name: "build"}}, ""},
+		{"no containers", "storybook", nil, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := tailContainer("coalesce.images.storybook", test.requested, test.containers); got != test.want {
+				t.Fatalf("got %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSelectTailPod(t *testing.T) {
 	pod := func(name string, created int64, phase corev1.PodPhase) corev1.Pod {
 		return corev1.Pod{

@@ -702,13 +702,19 @@ func handleGetLogs(w http.ResponseWriter, r *http.Request) {
 	job := r.PathValue("job")
 	container := r.PathValue("container")
 
-	// Find the log path
+	// Older UIs use the step name as the container name. Resolve that alias
+	// only when there is a single recorded container; sidecars need a name.
 	var logPath string
 	err := db.QueryRow(`
-		SELECT log_path FROM containers
-		WHERE namespace = $1 AND slug = $2 AND job = $3 AND container = $4
-		ORDER BY started_at DESC LIMIT 1
-	`, namespace, slug, job, container).Scan(&logPath)
+		WITH latest AS (
+			SELECT DISTINCT ON (container) container, log_path FROM containers
+			WHERE namespace = $1 AND slug = $2 AND job = $3
+			ORDER BY container, started_at DESC
+		)
+		SELECT log_path FROM latest
+		WHERE container = $4 OR ($4 = $5 AND (SELECT count(*) FROM latest) = 1)
+		ORDER BY (container = $4) DESC LIMIT 1
+	`, namespace, slug, job, container, stepName(job)).Scan(&logPath)
 
 	if err == sql.ErrNoRows {
 		http.Error(w, "Log not found", http.StatusNotFound)
@@ -789,6 +795,23 @@ func selectTailPod(pods []corev1.Pod) *corev1.Pod {
 	return selected
 }
 
+func stepName(job string) string {
+	parts := strings.Split(job, ".")
+	return parts[len(parts)-1]
+}
+
+func tailContainer(job, requested string, containers []corev1.Container) string {
+	for _, container := range containers {
+		if container.Name == requested {
+			return requested
+		}
+	}
+	if len(containers) == 1 && (requested == "" || requested == stepName(job)) {
+		return containers[0].Name
+	}
+	return ""
+}
+
 // A log tail is one Kubernetes stream written directly to one WebSocket. The
 // read and write stay in the same loop so a full socket stops the Kubernetes
 // reader instead of turning log content into lossy broadcast events.
@@ -816,12 +839,9 @@ func handleTailLogs(w http.ResponseWriter, r *http.Request) {
 
 	podName := pod.Name
 
-	// Default to first container if not specified.
-	if container == "" && len(pod.Spec.Containers) > 0 {
-		container = pod.Spec.Containers[0].Name
-	}
+	container = tailContainer(job, container, pod.Spec.Containers)
 	if container == "" {
-		http.Error(w, "Pod has no containers", http.StatusBadRequest)
+		http.Error(w, "Specify a container from the Pod", http.StatusBadRequest)
 		return
 	}
 
