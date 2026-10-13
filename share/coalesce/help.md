@@ -25,11 +25,8 @@ directly with `kubectl apply` and watches them with `kubectl get --watch`. A
 separate Go server can observe and record run metadata to PostgreSQL and logs
 to cloud storage, but the executor operates independently.
 
-Coalesce exists because we were already doing the work. We had Tekton running
-pipelines, and around Tekton we had glue that fought its abstractions rather
-than leveraging them. When we measured the glue against what a purpose-built
-executor would require, the numbers were comparable. The path of least
-resistance stopped being the wrapper and became the thing itself.
+Coalesce keeps pipeline logic in Zsh and uses Kubernetes Jobs directly rather
+than introducing another workload abstraction.
 ## OPTIONS
 > options
 ## COMMANDS

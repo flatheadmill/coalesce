@@ -375,11 +375,8 @@ function _coalesce_run {
                     _coalesce_run_start_jobs
                     # A create the API server refuses makes no Job, so no
                     # watch event will ever report it. Ask over again here or
-                    # the read above blocks until the watch stream happens to
-                    # end — a run once sat thirty-three minutes on exactly
-                    # that, and thirty-three was one sample of "however long
-                    # the connection lives." The same question its twin asks
-                    # a few lines up, at the other place over can turn true.
+                    # the read above blocks until the watch stream ends.
+                    # Check completion here as well as after a terminal event.
                     if (( _coalesce[over] )); then
                         _coalesce_stop_children
                         break

@@ -2,8 +2,8 @@
 
 Four begins with the developer arriving from a GitHub check. The run's result,
 its Jobs, their durations, and the selected output belong on the first screen.
-The dashboard register follows Nascent: a modest heading, ordinary controls,
-and the information the reader came for. Resource telemetry is outside this cut.
+The dashboard uses a modest heading, ordinary controls, and the information
+the reader came for. Resource telemetry is outside this cut.
 
 The runs page is a newest-first table: Result, Run, Started, Duration. Each
 invocation keeps its own row. Search and status filtering cover the API's latest
@@ -53,9 +53,8 @@ line; it is not a claim about raw container bytes. An empty stored response is
 distinct from a missing artifact. A failed refresh preserves already received
 text. Repeated attempts get a short local attribution caveat.
 
-This is a later brief, agreed with coalesce and discussed with coalesce-fable in
-three exchanges on October 5, 2026. It deliberately carries forward useful work
-from the earlier cuts. One, Two and Three remain intact at the base ea19232.
+This design carries forward work from the earlier interfaces.
+One, Two and Three remain intact at the base ea19232.
 Four imports only the shared transport; it owns its presentation and behavior.
 
 ## Local preview
