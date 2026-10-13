@@ -17,7 +17,8 @@ function _coalesce_dag_descend_json {
             _coalesce_dag_descend_json ${dag}.${node}
             ;;
         (pod)
-            jo -- name=$node under=${dag} kind=node
+            jo -- name=$node under=${dag} kind=node \
+                -s cluster="$_coalesce[${dag}.${node}:cluster]"
             ;;
         esac
     done
@@ -44,13 +45,13 @@ function _coalesce_dag_json {
 }
 
 function :args:dag {
-    eval "$(args s,slug N,namespace -bx h,help -- "$@")"
+    eval "$(args s,slug N,namespace c,cluster -bx h,help -- "$@")"
 }
 
 function :execute:dag {
     [[ -v o_slug ]] || abend 'slug is required'
     [[ -v o_namespace ]] || o_namespace=default
-    _coalesce_init
+    _coalesce_init "${o_cluster:-}"
     source $1
     _coalesce_dag_json
 }

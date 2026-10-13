@@ -6,22 +6,25 @@ typeset -ga _coalesce_children=()
 typeset -g _coalesce_run_started=0
 typeset -g _coalesce_run_status=
 
-# tini forwards the runner's TERM to Coalesce and its foreground children.
+# tini -g forwards TERM to the runner's process group. Watch listeners forward
+# it to their separate kubectl process groups.
 # Install the handler before argument parsing or storage calls so Coalesce can
 # always record the interruption, including during the narrow startup window
 # before the run command has initialized.
 function _coalesce_stop_children {
     typeset child
     for child in "${(@)_coalesce_children}"; do
-        kill $child 2> /dev/null
+        kill $child 2> /dev/null || :
     done
     for child in "${(@)_coalesce_children}"; do
-        wait $child 2> /dev/null
+        wait $child 2> /dev/null || :
     done
     _coalesce_children=()
 }
 
 function TRAPTERM {
+    (( ZSH_SUBSHELL )) && exit 143
+    trap '' TERM
     _coalesce_run_status=interrupted
     _coalesce_stop_children
     if (( _coalesce_run_started )) &&
@@ -49,7 +52,8 @@ function _coalesce_cksum {
 # top-level steps run serially — the pipeline is a sequence, parallelism
 # happens inside tranches.
 function _coalesce_init {
-    typeset -gA _coalesce=( coalesce:queue '' coalesce:over 0 coalesce:parallel 1 )
+    typeset -gA _coalesce=( coalesce:queue '' coalesce:over 0 coalesce:parallel 1
+        coalesce:default_cluster "${1:-}" )
     _coalesce_children=()
 }
 
@@ -61,13 +65,14 @@ function _coalesce_init {
 # internally. -p0 means unlimited parallelism (2^63-1 so the comparison logic
 # stays uniform), -p1 means serial, -pN means at most N concurrent children.
 function step {
-    eval "$(args n,name u,under p,parallel f,func -- "$@")"
+    eval "$(args n,name u,under p,parallel f,func c,cluster -- "$@")"
     typeset node pod split=() under=() join=( coalesce ) queue=()
     if [[ -v o_under ]]; then
         join=( coalesce "${(As:/:)o_under}" )
     fi
     under="${(j:.:)join}"
     if [[ -v o_parallel ]]; then
+        [[ ! -v o_cluster ]] || abend 'execution cluster belongs to a pod step'
         (( ${+_coalesce[${under}:queue]} )) || abend "no such node to put under"
         _coalesce[${under}.${o_name}:queue]=
         queue=( "${(@AQ)${(z)_coalesce[${under}:queue]}}" )
@@ -85,10 +90,21 @@ function step {
         (( ${+_coalesce[${under}:queue]} )) || abend "no such node to put under"
         typeset args=( "$@" )
         eval "$(args e,env -- "$@")"
+        if [[ -z ${o_cluster:-} ]]; then
+            # Resolve only the first omitted placement. run passes this same
+            # default to dag when it sources the pipeline a second time.
+            if [[ -z $_coalesce[coalesce:default_cluster] ]]; then
+                _coalesce[coalesce:default_cluster]=$(kubectl config current-context) &&
+                    [[ -n $_coalesce[coalesce:default_cluster] ]] ||
+                    abend 'a step without -c requires a named current-context in KUBECONFIG'
+            fi
+            o_cluster=$_coalesce[coalesce:default_cluster]
+        fi
         queue=( "${(@AQ)${(z)_coalesce[${under}:queue]}}" )
         queue+=( $o_name )
         _coalesce[${under}:queue]="${(@qq)queue}"
         _coalesce[${under}.${o_name}:kind]=pod
+        _coalesce[${under}.${o_name}:cluster]=$o_cluster
         _coalesce[${under}.${o_name}:args]=${(j: :)${(@qq)args}}
     fi
 }

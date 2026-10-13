@@ -137,6 +137,7 @@ type RunUpdateRequest struct {
 
 type JobStartRequest struct {
 	StartedAt *time.Time `json:"started_at,omitempty"`
+	Cluster   string     `json:"cluster,omitempty"`
 }
 
 type JobUpdateRequest struct {
@@ -293,9 +294,9 @@ func handlePostJob(w http.ResponseWriter, r *http.Request) {
 	// COALESCE lets PostgreSQL handle the default. If the executor doesn't
 	// provide started_at, now() fills in. No Go-side defaulting.
 	_, err := db.Exec(`
-		INSERT INTO jobs (namespace, slug, job, started_at, status)
-		VALUES ($1, $2, $3, COALESCE($4, now()), 'running')
-	`, namespace, slug, job, req.StartedAt)
+		INSERT INTO jobs (namespace, slug, job, started_at, status, cluster)
+		VALUES ($1, $2, $3, COALESCE($4, now()), 'running', $5)
+	`, namespace, slug, job, req.StartedAt, req.Cluster)
 
 	if err != nil {
 		slog.Error("Failed to create job", "error", err)
@@ -597,6 +598,7 @@ func handleGetRun(w http.ResponseWriter, r *http.Request) {
 
 	type Job struct {
 		Job         string     `json:"job"`
+		Cluster     string     `json:"cluster,omitempty"`
 		StartedAt   time.Time  `json:"started_at"`
 		CompletedAt *time.Time `json:"completed_at,omitempty"`
 		Status      string     `json:"status"`
@@ -617,7 +619,7 @@ func handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// complete between them.
 	rows, err := db.Query(`
 		SELECT r.slug, r.pipeline, r.started_at, r.completed_at, r.status,
-			j.job, j.started_at, j.completed_at, j.status, j.exit_code
+			j.job, j.cluster, j.started_at, j.completed_at, j.status, j.exit_code
 		FROM runs r
 		LEFT JOIN jobs j ON j.namespace = r.namespace AND j.slug = r.slug
 		WHERE r.namespace = $1 AND r.slug = $2
@@ -635,6 +637,7 @@ func handleGetRun(w http.ResponseWriter, r *http.Request) {
 
 	for rows.Next() {
 		var jobName *string
+		var jobCluster *string
 		var jobStartedAt *time.Time
 		var jobCompletedAt *time.Time
 		var jobStatus *string
@@ -642,7 +645,7 @@ func handleGetRun(w http.ResponseWriter, r *http.Request) {
 
 		if err := rows.Scan(
 			&run.Slug, &run.Pipeline, &run.StartedAt, &run.CompletedAt, &run.Status,
-			&jobName, &jobStartedAt, &jobCompletedAt, &jobStatus, &jobExitCode,
+			&jobName, &jobCluster, &jobStartedAt, &jobCompletedAt, &jobStatus, &jobExitCode,
 		); err != nil {
 			continue
 		}
@@ -651,6 +654,7 @@ func handleGetRun(w http.ResponseWriter, r *http.Request) {
 		if jobName != nil {
 			run.Jobs = append(run.Jobs, Job{
 				Job:         *jobName,
+				Cluster:     *jobCluster,
 				StartedAt:   *jobStartedAt,
 				CompletedAt: jobCompletedAt,
 				Status:      *jobStatus,

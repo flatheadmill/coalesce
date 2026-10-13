@@ -16,10 +16,31 @@ the `step` function. Steps without a `-p` flag become pods, actual Kubernetes
 Jobs. Steps with a `-p` flag become tranches, containers for other steps that
 control parallelism.
 
-The executor maintains a watch loop using `kubectl get jobs --watch`. When a
-job completes, completion propagates up the DAG. The executor recalculates
-which jobs are runnable given parallelism constraints and launches the next
-batch. The loop continues until all steps are complete.
+The executor maintains a `kubectl get jobs --watch` listener for each execution
+context used in the DAG. All listeners live for the whole pipeline and feed
+one FIFO. The parent updates the DAG and launches newly runnable Jobs after
+each completion.
+
+`step -c CONTEXT` selects an execution context from the supplied `KUBECONFIG`,
+using `kubectl --context` for both creation and observation. The first step
+without `-c` resolves kubectl's current context once; subsequent omitted
+placements use that same name, including the recorded DAG. Pipelines with
+every context explicit do not need a current context. All Jobs use the run's
+namespace. The context says where a Job executes; any workload target it
+operates on is still part of that Job's own command and credentials.
+
+A runner using omitted placement must have a named current context in its
+supplied kubeconfig. Kubernetes' in-cluster authentication fallback alone need
+not provide one; the runner setup must supply that context explicitly.
+
+```zsh
+step -n calculate -c compute -- pod alpine -- echo calculating
+```
+
+The context is stored in DAG and Job properties. Kubernetes Jobs and Pods
+carry it as an annotation because context names need not be label values.
+The listener draft uses Linux FIFO writes, `setsid` and `zsh/system`. Remote
+log transport and UI placement display remain separate integration work.
 
 Jobs are labeled with `coalesce.flatheadmill.com/slug` and
 `coalesce.flatheadmill.com/job` to identify which pipeline and step they belong

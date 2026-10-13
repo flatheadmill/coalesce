@@ -88,13 +88,15 @@ function _coalesce_job_yaml {
         return 1
     fi
     typeset labels=$(
-        jo -- coalesce.flatheadmill.com/job=$job coalesce.flatheadmill.com/slug=$o_slug
+        jo -- -s coalesce.flatheadmill.com/job=$job \
+            -s coalesce.flatheadmill.com/slug=$o_slug
     )
     # imagePullSecrets is optional: emitted only when COALESCE_IMAGE_PULL_SECRET
     # names the secret, so public-image and OrbStack runs stay untouched while a
     # private-registry cluster can pull.
     k8s[yaml]=$(
         gojq --yaml-input --yaml-output \
+            --arg cluster "$_coalesce[${job}:cluster]" \
             --argjson args "$(jo \
                 name=$name \
                 labels=$labels \
@@ -104,7 +106,9 @@ function _coalesce_job_yaml {
             .metadata.name = $args.name |
             .metadata.namespace = $args.namespace |
             .metadata.labels = $args.labels |
-            .spec.template.metadata.labels = $args.labels
+            .spec.template.metadata.labels = $args.labels |
+            .metadata.annotations["coalesce.flatheadmill.com/cluster"] = $cluster |
+            .spec.template.metadata.annotations["coalesce.flatheadmill.com/cluster"] = $cluster
         '  <(printf %s "$o_yaml")
     )
 }
@@ -251,8 +255,8 @@ function _coalesce_descend_jobs {
 # from PostgreSQL at startup, already-completed jobs are skipped. A rejected
 # Job is a failed node, not a reason to wait forever for a watch event that can
 # never arrive. Drain immediate failures here so independent work still runs
-# and a run with no successfully created Jobs can unwind without opening a
-# watch.
+# and a run with no successfully created Jobs can unwind without waiting for
+# an event.
 function _coalesce_run_start_jobs {
     typeset job current=()
     typeset -A k8s
@@ -265,10 +269,12 @@ function _coalesce_run_start_jobs {
             (( ${+_coalesce[${job}:ran]} )) && continue
             _coalesce[${job}:ran]=1
             curl -s -X POST "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${job}" \
-                -H 'Content-Type: application/json' -d '{}' > /dev/null
+                -H 'Content-Type: application/json' \
+                -d "$(jo -- -s cluster="$_coalesce[${job}:cluster]")" > /dev/null
             # TODO Check with app if there is a metadata.json.
             if _coalesce_job_yaml $job &&
-                    kubectl apply --namespace $o_namespace -f - <<< $k8s[yaml]; then
+                    kubectl --context "$_coalesce[${job}:cluster]" apply \
+                        --namespace $o_namespace -f - <<< $k8s[yaml]; then
                 continue
             fi
             create_failed=1
@@ -284,108 +290,153 @@ function _coalesce_run_start_jobs {
     done
 }
 
-# The event loop. After the initial descend-and-launch, it opens a kubectl
-# watch as a coproc filtered by the slug label. Every job created with this
-# slug appears in the watch stream automatically — the loop feeds itself.
-#
-# The outer while loop exists because kubectl watches can disconnect. If the
-# watch drops, it restarts. The inner loop reads JSON events, parses them
-# through jq into a tape (a flat array of labels and conditions), and acts
-# on completions: mark done, propagate up, descend for new work, launch.
-#
-# The coproc pattern: open as coproc, capture PID, steal the fd, then
-# immediately replace the coproc slot with a no-op so the fd stays open
-# without holding the coproc. This lets us track the PID for SIGTERM cleanup.
+function _coalesce_interrupt {
+    trap "" TERM
+    _coalesce_run_status=interrupted
+    _coalesce_stop_children
+    [[ -n $watch_fd ]] && exec {watch_fd}>&-
+    watch_fd=
+    [[ -n $watch_dir ]] && rm -rf -- "$watch_dir"
+    watch_dir=
+    _coalesce_finish_run
+    # exit need not run the always block; this trap has cleaned up itself.
+    exit 143
+}
+
+# One listener per context feeds the FIFO for the whole pipeline. The parent
+# alone changes the DAG. Every placement is a resolved context name from the
+# supplied KUBECONFIG.
 function _coalesce_run {
-    typeset runnable=() tape=() outcomes=()
-    typeset line key value terminal outcome_count outcome
-    typeset -A labels
-    _coalesce_descend_jobs coalesce
-    _coalesce_run_start_jobs
-    integer fd child entries over
-    while (( ! _coalesce[over] )); do
-        coproc kubectl get jobs --namespace $o_namespace -l coalesce.flatheadmill.com/slug=$o_slug \
-            --watch --output-watch-events --output json
-        child=${!}
-        _coalesce_children+=( $child )
-        exec {fd}<&p;
-        coproc :
-        # Each JSON event is flattened by jq into a tape: label count, then
-        # key-value pairs, then condition count, then condition types. This
-        # avoids calling jq multiple times per event — one parse extracts
-        # everything, Zsh unpacks it positionally.
-        while read -r line; do
-            tape=( "${(@QA)${(z)$(
-                jq -r '
-                    (.object.status.conditions // [{type:"Pending"}]) as $conditions |
-                    [
-                        (.object.metadata.labels | length),
-                        (.object.metadata.labels | to_entries[] | (.key, .value)),
-                        ($conditions | length),
-                        ($conditions[] | .type)
-                    ] | @sh
-                '<<< $line
-            )}}" )
-            set -- "${(@)tape}"
-            entries=${1:-}
-            shift
-            while (( entries-- )); do
-                key=${1:-} value=${2:-}
-                shift 2
-                labels[$key]=$value
-            done
-            outcome_count=${1:-}
-            shift
-            outcomes=( "${(@)@[1,$outcome_count]}" )
-            shift $outcome_count
-            terminal=
-            for outcome in "${(@)outcomes}"; do
-                case $outcome in
-                (Pending|SuccessCriteriaMet) ;;
-                (Failed)
-                    typeset failed_job=$labels[coalesce.flatheadmill.com/job]
-                    if _coalesce_mark_terminal $failed_job failed; then
-                        terminal=$failed_job
-                        print failed $failed_job
-                        curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${failed_job}" \
-                            -H 'Content-Type: application/json' \
-                            -d '{"status": "failed"}' > /dev/null
-                    fi
-                    ;;
-                (Complete)
-                    typeset completed_job=$labels[coalesce.flatheadmill.com/job]
-                    if _coalesce_mark_terminal $completed_job completed; then
-                        terminal=$completed_job
-                        print complete $completed_job
-                        curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${completed_job}" \
-                            -H 'Content-Type: application/json' \
-                            -d '{"status": "completed"}' > /dev/null
-                    fi
-                    ;;
-                esac
-            done
-            if [[ -n $terminal ]]; then
-                if (( _coalesce[over] )); then
-                    _coalesce_stop_children
-                    break
-                fi
-                runnable=()
-                _coalesce_descend_jobs coalesce
-                if (( ${#runnable} )); then
-                    _coalesce_run_start_jobs
-                    # A create the API server refuses makes no Job, so no
-                    # watch event will ever report it. Ask over again here or
-                    # the read above blocks until the watch stream ends.
-                    # Check completion here as well as after a terminal event.
-                    if (( _coalesce[over] )); then
-                        _coalesce_stop_children
-                        break
-                    fi
-                fi
-            fi
-        done <&${fd}
-        _coalesce_stop_children
+    setopt localoptions localtraps
+    typeset runnable=() tape=() key cluster job terminal line
+    typeset -aU clusters=()
+    typeset watch_dir= watch_fd=
+    for key in "${(@k)_coalesce}"; do
+        [[ $key = *:cluster ]] && clusters+=( "$_coalesce[$key]" )
     done
+    if (( ! ${#clusters} )); then
+        _coalesce[coalesce:status]=completed
+        return 0
+    fi
+
+    trap '_coalesce_interrupt' TERM
+    {
+        zmodload zsh/system || return 1
+        watch_dir=$(mktemp -d "${TMPDIR:-/tmp}/coalesce.XXXXXXXX") || return 1
+        mkfifo "$watch_dir/events" || return 1
+        # Linux permits this open without a writer. It also means EOF cannot
+        # tell us a listener died; that remains a question for the walkthrough.
+        sysopen -rw -o cloexec -u watch_fd "$watch_dir/events" || return 1
+        for cluster in "${(@)clusters}"; do
+            function {
+                setopt localoptions localtraps
+                unsetopt multibyte
+                typeset child= raw= out= before=$! record line
+                # The parent's list trap resets to default on this fork.
+                # Our list trap returns from this anonymous function, through
+                # its always block, even from a read or full-FIFO syswrite.
+                trap 'trap "" TERM; return 143' TERM
+                trap '' PIPE
+                {
+                    exec {watch_fd}>&-
+                    sysopen -w -o cloexec -u out "$watch_dir/events" || return 1
+                    while true; do
+                        before=$!
+                        # List the current Jobs, then watch for changes.
+                        coproc setsid kubectl --context "$cluster" get jobs \
+                            --namespace $o_namespace -l coalesce.flatheadmill.com/slug=$o_slug \
+                            --watch --output-watch-events --output json {out}>&-
+                        child=$!
+                        exec {raw}<&p || return 1
+                        # Replacement closes the old stdin pipe, not the
+                        # process or our saved read descriptor.
+                        coproc :
+                        while IFS= read -r -u $raw line; do
+                            record=$(jq -r '
+                                select(.type == "ADDED" or .type == "MODIFIED") |
+                                .object | select(.kind == "Job") |
+                                .metadata.labels["coalesce.flatheadmill.com/job"] as $job |
+                                select($job | type == "string") |
+                                [.status.conditions[]? | select(.status == "True") | .type] as $conditions |
+                                (if $conditions | index("Failed") then "failed"
+                                 elif $conditions | index("Complete") then "completed"
+                                 else empty end) as $status |
+                                [$job, $status] | @sh
+                            ' <<< "$line" {out}>&- {raw}<&-) || break
+                            [[ -n $record ]] || continue
+                            # Context names need not be label values. Dollar
+                            # quoting keeps even a newline inside one record.
+                            record="${(qqqq)cluster} $record"$'\n'
+                            # MULTIBYTE is off: count bytes including newline.
+                            # One blocking Linux write <= PIPE_BUF is atomic.
+                            if (( ${#record} > 4096 )); then
+                                print -u2 "Job event tape exceeds PIPE_BUF: $cluster"
+                                return 1
+                            fi
+                            syswrite -o $out "$record" || return 1
+                        done
+                        # Before reconnecting, signal the watch's group and
+                        # its PID, wait for it, then signal the group again
+                        # for any remaining helper. The direct PID covers
+                        # the interval before setsid creates the group.
+                        kill -TERM -- -$child 2> /dev/null
+                        kill -TERM $child 2> /dev/null
+                        wait $child 2> /dev/null
+                        kill -TERM -- -$child 2> /dev/null
+                        exec {raw}<&-
+                        raw=
+                        before=$!
+                        child=
+                        # Bound reconnect churn. TERM waits at most this
+                        # second for the foreground command to finish.
+                        sleep 1
+                    done
+                } always {
+                    trap '' TERM
+                    # A queued TERM can precede child=$!, but Zsh has already
+                    # published the new PID before it runs the trap.
+                    [[ -z $child && $! != $before ]] && child=$!
+                    if [[ -n $child ]]; then
+                        kill -TERM -- -$child 2> /dev/null
+                        kill -TERM $child 2> /dev/null
+                        wait $child 2> /dev/null
+                        kill -TERM -- -$child 2> /dev/null
+                    fi
+                    [[ -n $raw ]] && exec {raw}<&-
+                    [[ -n $out ]] && exec {out}>&-
+                }
+            } &
+            # tini -g reaches the listener even before this append. A signal
+            # sent only to the parent in this interval remains a draft edge.
+            _coalesce_children+=( $! )
+        done
+
+        _coalesce_descend_jobs coalesce
+        _coalesce_run_start_jobs
+        while (( ! _coalesce[over] )); do
+            IFS= read -r -u $watch_fd line || return 1
+            tape=( "${(@QA)${(z)line}}" )
+            (( ${#tape} == 3 )) || continue
+            cluster=$tape[1] job=$tape[2] terminal=$tape[3]
+            [[ $_coalesce[${job}:kind] = pod &&
+               $_coalesce[${job}:cluster] = $cluster &&
+               ${_coalesce[${job}:ran]:-0} = 1 ]] || continue
+            [[ $terminal = (failed|completed) ]] || continue
+            if _coalesce_mark_terminal "$job" "$terminal"; then
+                print $terminal $job
+                curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${job}" \
+                    -H 'Content-Type: application/json' \
+                    -d "$(jo status=$terminal)" > /dev/null
+                (( _coalesce[over] )) && break
+                _coalesce_descend_jobs coalesce
+                _coalesce_run_start_jobs
+            fi
+        done
+    } always {
+        _coalesce_stop_children
+        [[ -n $watch_fd ]] && exec {watch_fd}>&-
+        [[ -n $watch_dir ]] && rm -rf -- "$watch_dir"
+    }
     print exiting
 }
 
@@ -413,7 +464,8 @@ function :execute:run {
     # Invoke the dag subcommand rather than calling functions directly —
     # subcommands stay in their own files so they don't all get copied
     # into branch commands.
-    typeset dag_json=$($zshctl[argzero] dag -s $o_slug $1)
+    typeset dag_json=$($zshctl[argzero] dag -s $o_slug \
+        -c "$_coalesce[coalesce:default_cluster]" $1)
     curl -s -X POST "${_coalesce_url}/api/${o_namespace}/dags/${o_slug}" \
         -H 'Content-Type: application/json' \
         -d "{\"dag\": $dag_json}" > /dev/null || abend 'unable to reach storage'
