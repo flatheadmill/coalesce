@@ -327,7 +327,7 @@ For a portable installation, manifests/operator.yaml has the same RBAC and
 binary with a registry image name. Create its coalesce namespace, install
 manifests/crd.yaml, and publish or substitute that image before applying the
 operator manifest. manifests/example-pipeline.yaml is a standalone example.
-This does not migrate any Acres resource or publish an image by itself.
+This does not migrate existing resources or publish an image by itself.
 
 ---
 

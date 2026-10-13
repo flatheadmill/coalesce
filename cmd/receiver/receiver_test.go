@@ -706,20 +706,20 @@ func TestReceiverLogsBodyReadFailure(t *testing.T) {
 func TestRunSlugCarriesNameIdentityAndEpoch(t *testing.T) {
 	epoch := strconv.FormatInt(testNow.Unix(), 36)
 
-	pr := runSlug("webster-build", webhookEnvelope{Number: 511}, testNow)
-	if pr != "webster-build-511-"+epoch {
+	pr := runSlug("example-build", webhookEnvelope{Number: 511}, testNow)
+	if pr != "example-build-511-"+epoch {
 		t.Fatalf("pull request slug = %q", pr)
 	}
 
-	push := runSlug("webster-zero", webhookEnvelope{
+	push := runSlug("example-zero", webhookEnvelope{
 		After: "AA427401a7f535ce2a69b51e851f5e5f1e1990d7",
 	}, testNow)
-	if push != "webster-zero-aa42740-"+epoch {
+	if push != "example-zero-aa42740-"+epoch {
 		t.Fatalf("push slug = %q", push)
 	}
 
-	bare := runSlug("webster-close", webhookEnvelope{}, testNow)
-	if bare != "webster-close-"+epoch {
+	bare := runSlug("example-close", webhookEnvelope{}, testNow)
+	if bare != "example-close-"+epoch {
 		t.Fatalf("bare slug = %q", bare)
 	}
 
