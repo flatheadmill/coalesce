@@ -50,8 +50,21 @@ function pod {
                   namespace: null
                   labels: {}
                 spec:
-                  backoffLimit: 0
+                  backoffLimit: 3
                   ttlSecondsAfterFinished: 300
+                  # Spot preemption and eviction are infrastructure failures,
+                  # not another attempt at the program. Count those against a
+                  # small retry budget, while an ordinary nonzero exit fails
+                  # immediately. Pending for replacement capacity costs no retry.
+                  podFailurePolicy:
+                    rules:
+                    - action: Count
+                      onPodConditions:
+                      - type: DisruptionTarget
+                    - action: FailJob
+                      onExitCodes:
+                        operator: NotIn
+                        values: [0]
                   template:
                     metadata:
                       labels: {}
