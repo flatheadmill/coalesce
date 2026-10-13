@@ -9,16 +9,20 @@
     "dev:one": "vite --config one/vite.config.ts",
     "dev:two": "vite --config two/vite.config.ts",
     "dev:three": "vite --config three/vite.config.ts",
+    "dev:four": "vite --config four/vite.config.ts",
     "typecheck:one": "tsc --noEmit -p one/tsconfig.json",
     "typecheck:two": "tsc --noEmit -p two/tsconfig.json",
     "typecheck:three": "tsc --noEmit -p three/tsconfig.json",
+    "typecheck:four": "tsc --noEmit -p four/tsconfig.json",
     "build:one": "npm run typecheck:one && vite build --config one/vite.config.ts",
     "build:two": "npm run typecheck:two && vite build --config two/vite.config.ts",
     "build:three": "npm run typecheck:three && vite build --config three/vite.config.ts",
-    "build": "npm run build:one && npm run build:two && npm run build:three",
+    "build:four": "npm run typecheck:four && vite build --config four/vite.config.ts",
+    "build": "npm run build:one && npm run build:two && npm run build:three && npm run build:four",
     "preview:one": "vite preview --config one/vite.config.ts",
     "preview:two": "vite preview --config two/vite.config.ts",
-    "preview:three": "vite preview --config three/vite.config.ts"
+    "preview:three": "vite preview --config three/vite.config.ts",
+    "preview:four": "vite preview --config four/vite.config.ts"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
