@@ -303,6 +303,33 @@ function _coalesce_interrupt {
     exit 143
 }
 
+# Stash finished containers while their pods still exist. The execution context
+# supplies the logs; the central server supplies the recorded job timestamp.
+function _coalesce_stash_logs {
+    setopt localoptions pipefail
+    typeset job=$1 cluster=$2 entries line pod container
+    typeset -a entry
+    entries=$(
+        kubectl --context "$cluster" --namespace "$o_namespace" get pods \
+            -l "coalesce.flatheadmill.com/slug=$o_slug,coalesce.flatheadmill.com/job=$job" -o json |
+        jq -r '.items[] | .metadata.name as $pod |
+            (.status.initContainerStatuses[]?, .status.containerStatuses[]?) |
+            select(.state.terminated != null) | [$pod, .name] | @sh'
+    ) || return
+    [[ -n $entries ]] || return 1
+    for line in "${(@f)entries}"; do
+        entry=( "${(@QA)${(z)line}}" )
+        pod=$entry[1] container=$entry[2]
+        kubectl --context "$cluster" --namespace "$o_namespace" logs "$pod" \
+            -c "$container" > "$watch_dir/container.log" || return
+        curl --fail --connect-timeout 10 --max-time 120 \
+            -X POST "${_coalesce_url}/api/${o_namespace}/containers/${o_slug}/${job}/${container}" \
+            -H 'Content-Type: text/plain' --data-binary "@$watch_dir/container.log" \
+            > /dev/null || return
+        print "stashed $job/$container"
+    done
+}
+
 # One listener per context feeds the FIFO for the whole pipeline. The parent
 # alone changes the DAG. Every placement is a resolved context name from the
 # supplied KUBECONFIG.
@@ -424,6 +451,8 @@ function _coalesce_run {
             [[ $terminal = (failed|completed) ]] || continue
             if _coalesce_mark_terminal "$job" "$terminal"; then
                 print $terminal $job
+                _coalesce_stash_logs "$job" "$cluster" ||
+                    print -u2 -- "unable to stash logs for $job on $cluster"
                 curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${job}" \
                     -H 'Content-Type: application/json' \
                     -d "$(jo status=$terminal)" > /dev/null

@@ -414,7 +414,20 @@ func handlePostContainer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		startedAt = time.Now()
+		// The executor knows the job, while the server owns its attempt timestamp.
+		err := db.QueryRowContext(r.Context(), `
+			SELECT started_at FROM jobs
+			WHERE namespace = $1 AND slug = $2 AND job = $3
+			ORDER BY started_at DESC LIMIT 1
+		`, namespace, slug, job).Scan(&startedAt)
+		if err == sql.ErrNoRows {
+			http.Error(w, "Job not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			slog.Error("Failed to find job for container log", "error", err)
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	logContent, err := io.ReadAll(r.Body)
