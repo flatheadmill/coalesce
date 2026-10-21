@@ -52,6 +52,6 @@ function :execute:dag {
     [[ -v o_slug ]] || abend 'slug is required'
     [[ -v o_namespace ]] || o_namespace=default
     _coalesce_init "${o_cluster:-}"
-    source $1
+    source $1 || return
     _coalesce_dag_json
 }

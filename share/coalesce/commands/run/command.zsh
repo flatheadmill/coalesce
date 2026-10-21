@@ -488,13 +488,14 @@ function :execute:run {
     _coalesce_run_started=0
     _coalesce_run_status=running
     _coalesce_init
-    source $1
+    source $1 || return
     # POST the DAG and start a run in the cubbyhole before launching jobs.
     # Invoke the dag subcommand rather than calling functions directly —
     # subcommands stay in their own files so they don't all get copied
     # into branch commands.
-    typeset dag_json=$($zshctl[argzero] dag -s $o_slug \
-        -c "$_coalesce[coalesce:default_cluster]" $1)
+    typeset dag_json
+    dag_json=$($zshctl[argzero] dag -s $o_slug \
+        -c "$_coalesce[coalesce:default_cluster]" $1) || return
     curl -s -X POST "${_coalesce_url}/api/${o_namespace}/dags/${o_slug}" \
         -H 'Content-Type: application/json' \
         -d "{\"dag\": $dag_json}" > /dev/null || abend 'unable to reach storage'
