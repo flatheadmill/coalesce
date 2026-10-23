@@ -210,7 +210,7 @@ export function Output({ namespace, slug, job, attempts }: { namespace: string; 
       </>}
     </div>
     <TerminalSurface text={live.text} visible={source === "live"} label="Live output" atEnd />
-    <TerminalSurface text={stored.data ?? ""} visible={source === "stored"} label="Stored output" atEnd={latest?.status === "failed"} />
+    <TerminalSurface key={stored.container ?? ""} text={stored.data ?? ""} visible={source === "stored"} label="Stored output" atEnd={latest?.status === "failed"} />
     <div className="output-footnote">
       <span>{source === "live" ? "Received line by line in this tab." : "Copy returns the text received from storage."}</span>
       {attempts.length > 1 ? <span>{attempts.length} attempts. Output cannot be attributed to a specific attempt.</span> : null}
