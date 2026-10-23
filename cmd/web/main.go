@@ -713,6 +713,40 @@ func handleGetDAG(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Stored container identities survive Pod deletion. Names come from the same
+// records used by handleGetLogs; they do not imply main/init/sidecar roles.
+func handleGetContainers(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT DISTINCT container FROM containers
+		WHERE namespace = $1 AND slug = $2 AND job = $3
+		ORDER BY container
+	`, r.PathValue("namespace"), r.PathValue("slug"), r.PathValue("job"))
+	if err != nil {
+		slog.Error("Failed to query stored containers", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	names := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			slog.Error("Failed to read stored container", "error", err)
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		slog.Error("Failed to read stored containers", "error", err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(names)
+}
+
 func handleGetLogs(w http.ResponseWriter, r *http.Request) {
 	namespace := r.PathValue("namespace")
 	slug := r.PathValue("slug")
@@ -1128,6 +1162,7 @@ func main() {
 	mux.HandleFunc("GET /api/{namespace}/runs", handleGetRuns)
 	mux.HandleFunc("GET /api/{namespace}/runs/{slug}", handleGetRun)
 	mux.HandleFunc("GET /api/{namespace}/dags/{slug}", handleGetDAG)
+	mux.HandleFunc("GET /api/{namespace}/containers/{slug}/{job}", handleGetContainers)
 	mux.HandleFunc("GET /api/{namespace}/logs/{slug}/{job}/{container}", handleGetLogs)
 
 	// Live log tailing has its own WebSocket so log bytes never enter the

@@ -178,6 +178,10 @@ export function Output({ namespace, slug, job, attempts }: { namespace: string; 
   const storedNote = stored.data !== undefined
     ? stored.data === "" ? "The response contained no output." : `${(stored.data.split("\n").length - (stored.data.endsWith("\n") ? 1 : 0)).toLocaleString()} lines · ${(new TextEncoder().encode(stored.data).length / 1024).toFixed(1)} KiB`
     : stored.loading ? "Reading stored output…"
+    : !stored.error && stored.containers.length > 1 && !stored.container
+      ? "Select a container to read its stored output."
+    : !stored.error && stored.containers.length === 0
+      ? stored.polling ? "Waiting for stored output…" : "No stored output found."
     : stored.error instanceof ApiError && stored.error.status === 404
       ? stored.polling ? "Waiting for stored output…" : "No stored output found."
       : "Stored output unavailable";
@@ -189,6 +193,13 @@ export function Output({ namespace, slug, job, attempts }: { namespace: string; 
         <button type="button" aria-pressed={source === "stored"} onClick={() => selectSource("stored")}>Stored{stored.data !== undefined ? <span className="available-dot" aria-label="available" /> : null}</button>
       </div>
     </div>
+    {source === "stored" && stored.containers.length > 1 ? <label className="stored-container">
+      <span>Container</span>
+      <select value={stored.container ?? ""} onChange={event => stored.selectContainer(event.target.value)}>
+        <option value="" disabled>Select a container</option>
+        {stored.containers.map(name => <option key={name} value={name}>{name}</option>)}
+      </select>
+    </label> : null}
     <div className="output-note" role="status">
       {source === "live" ? <>
         <span>{live.note}{live.state === "exited" && open ? " · completion not recorded" : ""}</span>

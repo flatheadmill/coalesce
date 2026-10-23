@@ -98,6 +98,10 @@ export async function fetchLog(
   return body;
 }
 
+export function fetchContainers(namespace: string, slug: string, job: string): Promise<string[]> {
+  return getJSON(`/api/${segment(namespace)}/containers/${segment(slug)}/${segment(job)}`);
+}
+
 export function containerOf(job: string): string {
   return job.split(".").pop() ?? job;
 }

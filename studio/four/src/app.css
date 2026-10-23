@@ -101,6 +101,8 @@ a.graph-job:hover { border-color: #819cbf; background: #222f40; }
 .available-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--green); }
 .output-note { display: flex; align-items: center; gap: 14px; color: #acbacc; font-size: 12px; min-height: 34px; padding: 0 16px 10px; }
 .output-note button { font-size: 11px; padding: 3px 8px; }
+.stored-container { display: flex; align-items: center; gap: 12px; padding: 0 16px 12px; color: #acbacc; font-size: 12px; }
+.stored-container select { min-width: 180px; max-width: 100%; font-family: ui-monospace, monospace; }
 .terminal-surface { border-top: 1px solid var(--border); background: #0c1118; }
 .terminal-surface[hidden] { display: none; }
 .terminal-tools { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 12px; color: #9cacc1; font-size: 11px; background: #121b26; border-bottom: 1px solid #242f3f; }
