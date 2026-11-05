@@ -214,12 +214,13 @@ function _coalesce_descend_jobs {
     fi
     function {
         typeset child
-        integer from=$(( _coalesce[${node}:over] + 1 ))
+        integer from=1
         integer to=$(( _coalesce[${node}:started] + 1 ))
-        print $parent from: $from to: $to
+        print $node from: $from to: $to
         while (( from < to )); do
             child=${node}.${queue[$from]}
             ((from++))
+            (( ${+_coalesce[${child}:status]} )) && continue
             case $_coalesce[${child}:kind] in
             (tranche)
                 _coalesce_descend_jobs $child
