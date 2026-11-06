@@ -273,7 +273,8 @@ function _coalesce_run_start_jobs {
                 -H 'Content-Type: application/json' \
                 -d "$(jo -- -s cluster="$_coalesce[${job}:cluster]")" > /dev/null
             # TODO Check with app if there is a metadata.json.
-            if _coalesce_job_yaml $job &&
+            if (( ! ${+_coalesce[cluster:${_coalesce[${job}:cluster]}:unavailable]} )) &&
+                    _coalesce_job_yaml $job &&
                     kubectl --context "$_coalesce[${job}:cluster]" apply \
                         --namespace $o_namespace -f - <<< $k8s[yaml]; then
                 continue
@@ -360,6 +361,7 @@ function _coalesce_run {
                 setopt localoptions localtraps
                 unsetopt multibyte
                 typeset child= raw= out= before=$! record line
+                integer failures=0 received status
                 # The parent's list trap resets to default on this fork.
                 # Our list trap returns from this anonymous function, through
                 # its always block, even from a read or full-FIFO syswrite.
@@ -369,6 +371,7 @@ function _coalesce_run {
                     exec {watch_fd}>&-
                     sysopen -w -o cloexec -u out "$watch_dir/events" || return 1
                     while true; do
+                        received=0
                         before=$!
                         # List the current Jobs, then watch for changes.
                         coproc setsid kubectl --context "$cluster" get jobs \
@@ -380,6 +383,7 @@ function _coalesce_run {
                         # process or our saved read descriptor.
                         coproc :
                         while IFS= read -r -u $raw line; do
+                            received=1
                             record=$(jq -r '
                                 select(.type == "ADDED" or .type == "MODIFIED") |
                                 .object | select(.kind == "Job") |
@@ -410,11 +414,23 @@ function _coalesce_run {
                         kill -TERM -- -$child 2> /dev/null
                         kill -TERM $child 2> /dev/null
                         wait $child 2> /dev/null
+                        status=$?
                         kill -TERM -- -$child 2> /dev/null
                         exec {raw}<&-
                         raw=
                         before=$!
                         child=
+                        if (( status && ! received )); then
+                            ((failures++))
+                        else
+                            failures=0
+                        fi
+                        if (( failures == 3 )); then
+                            print -u2 "Job watcher unavailable after three attempts: $cluster"
+                            record="${(qqqq)cluster} coalesce unavailable"$'\n'
+                            syswrite -o $out "$record" || return 1
+                            return 1
+                        fi
                         # Bound reconnect churn. TERM waits at most this
                         # second for the foreground command to finish.
                         sleep 1
@@ -446,6 +462,26 @@ function _coalesce_run {
             tape=( "${(@QA)${(z)line}}" )
             (( ${#tape} == 3 )) || continue
             cluster=$tape[1] job=$tape[2] terminal=$tape[3]
+            if [[ $job = coalesce && $terminal = unavailable ]]; then
+                _coalesce[cluster:${cluster}:unavailable]=1
+                for key in "${(@k)_coalesce}"; do
+                    [[ $key = *:kind && $_coalesce[$key] = pod ]] || continue
+                    job=${key%:kind}
+                    [[ $_coalesce[${job}:cluster] = $cluster ]] || continue
+                    (( ${_coalesce[${job}:ran]:-0} == 1 &&
+                       ! ${+_coalesce[${job}:status]} )) || continue
+                    if _coalesce_mark_terminal "$job" failed; then
+                        print failed $job
+                        curl -s -X PUT "${_coalesce_url}/api/${o_namespace}/jobs/${o_slug}/${job}" \
+                            -H 'Content-Type: application/json' \
+                            -d '{"status": "failed"}' > /dev/null
+                    fi
+                done
+                (( _coalesce[over] )) && break
+                _coalesce_descend_jobs coalesce
+                _coalesce_run_start_jobs
+                continue
+            fi
             [[ $_coalesce[${job}:kind] = pod &&
                $_coalesce[${job}:cluster] = $cluster &&
                ${_coalesce[${job}:ran]:-0} = 1 ]] || continue
